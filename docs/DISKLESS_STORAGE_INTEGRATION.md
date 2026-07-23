@@ -143,7 +143,7 @@ used elsewhere in store-prolog). Sites, by line:
 | `id_to_object` | 97 | `id_object` | `id_object(..)?` |
 | `sp_card` | 289 | `triples_sp` | `triples_sp(..)?` |
 | `op_card` | 298 | `triples_o` | `triples_o(..)?` |
-| `id_triple_addition` / `_removal` | 304 / 378 | `triple_additions_*`/`_removals_*` | **not yet on SyncLazyLayer** — see §6 |
+| `id_triple_addition` / `_removal` | 304 / 378 | `triple_additions_*`/`_removals_*` | same on `SyncLazyLayer` (now available — see §6) |
 
 The `triples_*` methods return `Vec<IdTriple>` on `SyncLazyLayer` (vs a lazy
 iterator on `SyncStoreLayer`); wrap in `.into_iter()` and `Peekable<Box<dyn …>>`
@@ -180,17 +180,21 @@ Phase 2 is larger and can follow Phase 1 once the Prolog path is proven.
 
 ---
 
-## 6. Prerequisites still needed in terminus-store
-
-Before Phase 1 is complete, add to `terminus-store` (small, testable in that crate):
+## 6. Prerequisites in terminus-store — DONE
 
 - **`SyncLazyLayer::triple_additions_*` / `triple_removals_*`** (and the async
-  `LazyLayer` equivalents) — the delta iterators `id_triple_addition`/`_removal`
-  (layer.rs:304/378) need. The primitives exist internally
-  (`Store::selective_id_triples` already merges per-layer add/remove iterators);
-  expose signed single-layer variants.
-- Confirm `SyncLazyLayer::triples_*` return shape is convenient for the
-  `Peekable<Box<dyn Iterator>>` the FFI expects (currently `Vec`; fine).
+  `LazyLayer` equivalents), for the delta predicates `id_triple_addition`/`_removal`
+  (layer.rs:304/378): **implemented** on `GagnDeep/terminusdb-store@feat/object-store`.
+  `SyncLazyLayer` now exposes `triple_addition_exists` / `triple_removal_exists`,
+  `triple_additions` / `triple_removals`, and the `_s/_sp/_p/_o` filtered variants
+  of each — disk-less (each loads only this one layer's adjacency), differential-
+  tested against the materialized `SyncStoreLayer` over a base+child graph.
+- `SyncLazyLayer::triples_*` return `Vec<IdTriple>` (wrap in `.into_iter()` for the
+  `Peekable<Box<dyn Iterator>>` the FFI expects); the delta variants return
+  `Box<dyn Iterator<Item=IdTriple> + Send>` directly.
+
+So `SyncLazyLayer` now covers the **entire** read surface the store-prolog
+boundary uses; Phase 1 needs nothing further from terminus-store.
 
 ---
 
