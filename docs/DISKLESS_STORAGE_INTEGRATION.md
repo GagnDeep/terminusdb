@@ -85,23 +85,73 @@ generic over a read trait to accept a disk-less handle).
 
 ---
 
-## 3. Dependency wiring (one line)
+## 3. Dependency wiring (two edges, not one) — DONE
 
-`src/rust/Cargo.toml` has a workspace-wide `[patch.crates-io]` for `terminus-store`
-with a commented local option. Point it at the fork or a local checkout:
+`terminus-store` reaches this workspace over **two independent edges**. Both must
+move together, or cargo resolves two incompatible copies of the crate and every
+type crossing between them fails to unify.
 
-```toml
-[patch.crates-io]
-# fork with the disk-less API:
-terminus-store = { git = "https://github.com/GagnDeep/terminusdb-store", branch = "feat/object-store" }
-# or local:
-# terminus-store = { path = "../../../terminusdb-store" }
+1. **`terminusdb-store-prolog` declares it as a *git* dependency.** A
+   `[patch.crates-io]` entry does **not** cover a git dependency, and neither does
+   the `[patch."<git-url>"]` form when the fork's version differs from what the
+   original source resolves to — cargo silently reports `patch ... was not used`
+   and carries on with upstream. It has to be repointed in that package's own
+   manifest:
+
+   ```toml
+   # terminusdb-store-prolog/Cargo.toml
+   terminus-store = { git = "https://github.com/GagnDeep/terminusdb-store", \
+                      branch = "feat/object-store", features = ["object-store"] }
+   ```
+
+   The `features = ["object-store"]` is not optional: without it the entire
+   disk-less path is compiled out and the fork behaves exactly like upstream.
+
+2. **`terminusdb-grpc-labelstore-client` depends on it from crates.io.** That edge
+   *is* covered by the workspace `[patch.crates-io]`, which must name the same fork.
+
+Verify with `cargo tree -i terminus-store` — exactly one copy should appear, and
+`Cargo.lock` should show a single `terminus-store` entry pointing at the fork.
+
+### Build environment
+
+The fork is rebased onto `terminusdb-org/terminusdb-store` main (0.21.7), the
+upstream this workspace actually tracks, so no feature declarations need dropping.
+
+Three native dependencies are needed, none of which require root:
+
+```bash
+# protoc  — for terminusdb-grpc-labelstore-proto
+curl -sSL -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v25.3/protoc-25.3-linux-x86_64.zip
+mkdir -p ~/.local/protoc && (cd ~/.local/protoc && unzip -oq /tmp/protoc.zip)
+
+# SWI-Prolog 10.0.1 — for swipl-fli; matches the Makefile's SWIPL_VERSION.
+# Needs cmake (rootless tarball from Kitware) plus gcc/make and the
+# gmp/zlib/openssl/ncurses/readline headers. Build docs OFF: doc generation
+# references the `archive` package, which is skipped without libarchive-dev.
+cmake -DCMAKE_INSTALL_PREFIX=$HOME/.local/swipl -DCMAKE_BUILD_TYPE=Release \
+      -DINSTALL_DOCUMENTATION=OFF .. && cmake --build . -j$(nproc) && cmake --install .
+
+# libclang — for bindgen inside swipl-fli (any glibc-linked libclang.so works)
 ```
 
-Because it's a `crates-io` patch it rewrites `terminus-store` for the whole
-workspace; the per-crate git dep in `terminusdb-store-prolog/Cargo.toml` follows
-automatically. (Rebuild needs SWI-Prolog dev headers — the `swipl` crate links
-`libswipl`.)
+Then:
+
+```bash
+cd src/rust
+PATH=$HOME/.local/swipl/bin:$PATH \
+PROTOC=$HOME/.local/protoc/bin/protoc \
+LIBCLANG_PATH=$HOME/.local/libclang/lib \
+BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/11/include" \
+LD_LIBRARY_PATH=$HOME/.local/swipl/lib/swipl/lib/x86_64-linux:$LD_LIBRARY_PATH \
+cargo build --release
+```
+
+`BINDGEN_EXTRA_CLANG_ARGS` supplies clang's builtin headers (`stddef.h`); without
+it bindgen fails parsing `/usr/include/unistd.h`. `LD_LIBRARY_PATH` is needed at
+run time because the dylib links `libswipl.so.10` from the rootless prefix.
+
+Verified: the full workspace builds and all 39 Rust tests pass against the fork.
 
 ---
 
@@ -198,7 +248,10 @@ boundary uses; Phase 1 needs nothing further from terminus-store.
 
 ---
 
-## 7. Testing (requires SWI-Prolog)
+## 7. Testing
+
+SWI-Prolog 10.0.1 is available rootless (see §3, *Build environment*), so all
+three tiers below are runnable.
 
 1. **Rust unit tests** in `terminusdb-store-prolog` (no Prolog runtime needed for
    the pure-Rust dispatch, if factored out): a disk-less `ReadLayer` answers each
