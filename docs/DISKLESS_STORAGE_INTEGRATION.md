@@ -334,6 +334,55 @@ trait they call, not through a live query.
 
 ---
 
+## 5d. Reaching it from a running server — DONE
+
+Phases 1 and 2 made the disk-less path *work*; nothing in TerminusDB's Prolog
+actually *called* it. `default_triple_store/1` chose between the gRPC and local
+archive stores and had no object-store branch, so the predicates were
+unreachable from a running server: implemented, but not usable.
+
+Three environment variables now select it, following the same pattern as the
+existing `TERMINUSDB_GRPC_LABEL_ENDPOINT`:
+
+| Variable | Effect |
+|---|---|
+| `TERMINUSDB_OBJECT_STORE_BUCKET` | S3 bucket name, or `memory`. Unset ⇒ local archive store, so this is the switch |
+| `TERMINUSDB_OBJECT_STORE_PREFIX` | Key prefix, so several databases can share a bucket |
+| `TERMINUSDB_DISKLESS_READS=true` | Read block-lazily instead of materializing layers |
+
+Credentials, region and any endpoint override are read from the standard AWS
+environment variables by the object-store client; they are deliberately not part
+of this configuration and never pass through Prolog.
+
+Disk-less reads are **off by default** even when the bucket is set. They change
+the failure mode of every read — a query can now fail on a network error, not
+only on bad data — so opting in should be a deliberate act.
+
+### The problem this exposed
+
+`default_triple_store/1` serves reads *and* writes. Wiring it to a disk-less
+store would have broken every write, because Phase 1 made writes error on a
+disk-less layer.
+
+That was the wrong call. Building a child layer inherently needs its parent, so
+there is no block-lazy version of `open_write` — but refusing it means a
+disk-less store cannot be written to at all, which makes it useless as a
+drop-in. Those operations (`open_write`, squash, rollup, installing a head,
+applying a delta) now **materialize on demand**. It costs exactly what the
+disk-less path exists to avoid, which is why reads must never reach for it.
+
+The chain-cumulative triple counts looked like they needed the same treatment —
+computing them appeared to require every ancestor's adjacency. They do not:
+summing the per-layer counts is a handful of metadata reads the layer store
+already caches. They are now genuinely disk-less, not materialized.
+
+Verified end to end: with `TERMINUSDB_OBJECT_STORE_BUCKET=memory` and
+`TERMINUSDB_DISKLESS_READS=true`, a graph is created, written to, written to
+*again on top of a disk-less head layer*, and read back correctly —
+including `layer_total_triple_count`, which previously would have raised.
+
+---
+
 ## 6. Prerequisites in terminus-store — DONE
 
 - **`SyncLazyLayer::triple_additions_*` / `triple_removals_*`** (and the async

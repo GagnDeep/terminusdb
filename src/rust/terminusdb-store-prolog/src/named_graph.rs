@@ -57,14 +57,14 @@ predicates! {
         let graph: WrappedNamedGraph = graph_term.get_ex()?;
         let layer: WrappedLayer = layer_term.get_ex()?;
 
-        into_prolog_result(context.try_or_die(graph.set_head(context.try_or_die(layer.require_materialized_head())?))?)
+        into_prolog_result(context.try_or_die(graph.set_head(&context.try_or_die(layer.require_materialized_head())?))?)
     }
 
     pub semidet fn nb_force_set_head(context, graph_term, layer_term) {
         let graph: WrappedNamedGraph = graph_term.get_ex()?;
         let layer: WrappedLayer = layer_term.get_ex()?;
 
-        context.try_or_die(graph.force_set_head(context.try_or_die(layer.require_materialized_head())?))?;
+        context.try_or_die(graph.force_set_head(&context.try_or_die(layer.require_materialized_head())?))?;
 
         Ok(())
     }
@@ -76,7 +76,7 @@ predicates! {
 
         let version: u64 = version_term.get_ex()?;
 
-        let result = context.try_or_die(graph.force_set_head_version(context.try_or_die(layer.require_materialized_head())?, version))?;
+        let result = context.try_or_die(graph.force_set_head_version(&context.try_or_die(layer.require_materialized_head())?, version))?;
 
         into_prolog_result(result)
     }

@@ -99,15 +99,6 @@ impl DisklessLayer {
     }
 }
 
-/// Signal an operation the disk-less arm does not implement. Reported as an
-/// error, never as failure, so it can never be mistaken for "no results".
-fn unsupported<T>(what: &str) -> io::Result<T> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!("{what} requires a materialized layer; this layer is disk-less"),
-    ))
-}
-
 impl ReadLayer {
     /// The materialized layer, if this is one. Used by the write/admin
     /// predicates and by the Rust readers that are not yet disk-less aware.
@@ -128,14 +119,28 @@ impl ReadLayer {
     /// A layer usable where a real, built layer is required: installing a graph
     /// head, or applying a delta/diff into a builder. Those inputs are always
     /// layers this process just built, so they are always materialized.
-    pub fn require_materialized_head(&self) -> io::Result<&SyncStoreLayer> {
-        self.require_materialized("this operation")
+    pub fn require_materialized_head(&self) -> io::Result<SyncStoreLayer> {
+        self.materialized_layer("this operation")
     }
 
-    fn require_materialized(&self, what: &str) -> io::Result<&SyncStoreLayer> {
+    /// A materialized view of this layer, materializing on demand if needed.
+    ///
+    /// Some operations inherently need a whole layer: building a child on top
+    /// of it, squashing, rolling up, installing it as a graph head. They cannot
+    /// be done block-lazily by definition, and refusing them would mean a
+    /// disk-less store could not be written to at all.
+    ///
+    /// So this materializes rather than failing -- and costs exactly what the
+    /// disk-less path exists to avoid. **Reads must never call it.**
+    fn materialized_layer(&self, what: &str) -> io::Result<SyncStoreLayer> {
         match self {
-            Self::Materialized(l) => Ok(l),
-            Self::Lazy(_) => unsupported(what),
+            Self::Materialized(l) => Ok(l.clone()),
+            Self::Lazy(l) => l.inner().materialize()?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("{what}: layer could not be materialized"),
+                )
+            }),
         }
     }
 
@@ -382,41 +387,52 @@ impl ReadLayer {
     // ---- counts ----
     //
     // These are chain-cumulative triple counts. The disk-less handle would have
-    // to load every ancestor's adjacency to compute them, which defeats the
-    // point, so they stay materialized-only rather than being quietly slow.
+    // to load every ancestor's adjacency to compute them. They do not: summing
+    // the per-layer counts is a handful of cached metadata reads.
 
     pub fn triple_layer_addition_count(&self) -> io::Result<usize> {
-        self.require_materialized("layer_addition_count")?
-            .triple_layer_addition_count()
+        match self {
+            Self::Materialized(l) => l.triple_layer_addition_count(),
+            Self::Lazy(l) => l.inner().triple_layer_addition_count(),
+        }
     }
 
     pub fn triple_layer_removal_count(&self) -> io::Result<usize> {
-        self.require_materialized("layer_removal_count")?
-            .triple_layer_removal_count()
+        match self {
+            Self::Materialized(l) => l.triple_layer_removal_count(),
+            Self::Lazy(l) => l.inner().triple_layer_removal_count(),
+        }
     }
 
     pub fn try_triple_addition_count(&self) -> io::Result<usize> {
-        Ok(self
-            .require_materialized("layer_total_addition_count")?
-            .triple_addition_count())
+        match self {
+            Self::Materialized(l) => Ok(l.triple_addition_count()),
+            Self::Lazy(l) => l.inner().triple_addition_count(),
+        }
     }
 
     pub fn try_triple_removal_count(&self) -> io::Result<usize> {
-        Ok(self
-            .require_materialized("layer_total_removal_count")?
-            .triple_removal_count())
+        match self {
+            Self::Materialized(l) => Ok(l.triple_removal_count()),
+            Self::Lazy(l) => l.inner().triple_removal_count(),
+        }
     }
 
     pub fn try_triple_count(&self) -> io::Result<usize> {
-        Ok(self
-            .require_materialized("layer_total_triple_count")?
-            .triple_count())
+        match self {
+            Self::Materialized(l) => Ok(l.triple_count()),
+            Self::Lazy(l) => l.inner().triple_count(),
+        }
     }
 
+    /// Byte size of this layer's backing data. Not tracked disk-lessly, and
+    /// callers treat it as a metric rather than a result, so report unknown
+    /// rather than materializing a whole layer to answer it.
     pub fn try_stored_size(&self) -> io::Result<usize> {
-        Ok(self
-            .require_materialized("layer_stored_size")?
-            .stored_size())
+        match self {
+            Self::Materialized(l) => Ok(l.stored_size()),
+            Self::Lazy(_) => Ok(0),
+        }
     }
 
     // ---- value ranges ----
@@ -450,31 +466,31 @@ impl ReadLayer {
     // ---- writes and history rewriting (materialized only) ----
 
     pub fn open_write(&self) -> io::Result<SyncStoreLayerBuilder> {
-        self.require_materialized("open_write")?.open_write()
+        self.materialized_layer("open_write")?.open_write()
     }
 
     pub fn squash(&self) -> io::Result<SyncStoreLayer> {
-        self.require_materialized("squash")?.squash()
+        self.materialized_layer("squash")?.squash()
     }
 
     pub fn squash_upto(&self, upto: &ReadLayer) -> io::Result<SyncStoreLayer> {
-        let upto = upto.require_materialized("squash_upto")?;
-        self.require_materialized("squash_upto")?.squash_upto(upto)
+        let upto = upto.materialized_layer("squash_upto")?;
+        self.materialized_layer("squash_upto")?.squash_upto(&upto)
     }
 
     pub fn rollup(&self) -> io::Result<()> {
-        self.require_materialized("rollup")?.rollup()
+        self.materialized_layer("rollup")?.rollup()
     }
 
     pub fn rollup_upto(&self, upto: &ReadLayer) -> io::Result<()> {
-        let upto = upto.require_materialized("rollup_upto")?;
-        self.require_materialized("rollup_upto")?.rollup_upto(upto)
+        let upto = upto.materialized_layer("rollup_upto")?;
+        self.materialized_layer("rollup_upto")?.rollup_upto(&upto)
     }
 
     pub fn imprecise_rollup_upto(&self, upto: &ReadLayer) -> io::Result<()> {
-        let upto = upto.require_materialized("imprecise_rollup_upto")?;
-        self.require_materialized("imprecise_rollup_upto")?
-            .imprecise_rollup_upto(upto)
+        let upto = upto.materialized_layer("imprecise_rollup_upto")?;
+        self.materialized_layer("imprecise_rollup_upto")?
+            .imprecise_rollup_upto(&upto)
     }
 }
 
@@ -654,14 +670,14 @@ impl Layer for ReadLayer {
     fn triple_addition_count(&self) -> usize {
         match self {
             Self::Materialized(l) => l.triple_addition_count(),
-            Self::Lazy(l) => l.or_record(unsupported("triple_addition_count"), 0),
+            Self::Lazy(l) => l.or_record(l.inner().triple_addition_count(), 0),
         }
     }
 
     fn triple_removal_count(&self) -> usize {
         match self {
             Self::Materialized(l) => l.triple_removal_count(),
-            Self::Lazy(l) => l.or_record(unsupported("triple_removal_count"), 0),
+            Self::Lazy(l) => l.or_record(l.inner().triple_removal_count(), 0),
         }
     }
 
@@ -1595,62 +1611,6 @@ mod tests {
         );
     }
 
-    /// Operations the disk-less arm does not implement must be reported as
-    /// errors. A silent `None`/empty here would read as "no such thing" and
-    /// could be mistaken for a legitimate answer.
-    #[test]
-    fn disk_less_arm_rejects_unsupported_operations_loudly() {
-        let (m, l) = arms();
-
-        // `expect_err` would need Debug on the Ok types (builders, iterators),
-        // which they do not implement, so match instead.
-        macro_rules! rejects {
-            ($e:expr, $what:literal) => {
-                match $e {
-                    Ok(_) => panic!("{} should be rejected on a disk-less layer", $what),
-                    Err(err) => {
-                        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{}", $what);
-                        assert!(
-                            err.to_string().contains("disk-less"),
-                            "{} error should say why: {err}",
-                            $what
-                        );
-                    }
-                }
-            };
-        }
-
-        rejects!(l.open_write(), "open_write");
-        rejects!(l.squash(), "squash");
-        rejects!(l.rollup(), "rollup");
-        rejects!(l.squash_upto(&m), "squash_upto");
-        rejects!(l.rollup_upto(&m), "rollup_upto");
-        rejects!(l.imprecise_rollup_upto(&m), "imprecise_rollup_upto");
-        rejects!(l.try_triple_count(), "triple_count");
-        rejects!(l.try_triple_addition_count(), "triple_addition_count");
-        rejects!(l.try_triple_removal_count(), "triple_removal_count");
-        rejects!(
-            l.triple_layer_addition_count(),
-            "triple_layer_addition_count"
-        );
-        rejects!(l.triple_layer_removal_count(), "triple_layer_removal_count");
-        rejects!(l.try_stored_size(), "stored_size");
-
-        let low = <String as tdb_succinct::TdbDataType>::make_entry(&"a");
-        let high = <String as tdb_succinct::TdbDataType>::make_entry(&"z");
-        // value ranges are no longer in this list: they are block-lazy now, and
-        // both arms are compared in `layer_trait_reads_agree_on_both_arms`
-        assert!(l.try_triples_value_range(&low, &high).is_ok());
-
-        // the materialized arm still answers all of these
-        assert!(m.try_triple_count().unwrap() > 0);
-        // stored_size has a trait default of 0 for layers that do not track it,
-        // so only assert that the materialized arm answers rather than errors.
-        assert!(m.try_stored_size().is_ok());
-        assert!(m.open_write().is_ok());
-        assert!(m.try_triples_value_range(&low, &high).is_ok());
-    }
-
     /// The `Layer` trait impl is what the Rust readers (GraphQL, documents,
     /// paths) see. It must answer the same as the materialized layer.
     #[test]
@@ -1662,6 +1622,8 @@ mod tests {
         assert_eq!(m.parent_name(), l.parent_name());
         assert_eq!(m.node_and_value_count(), l.node_and_value_count());
         assert_eq!(m.predicate_count(), l.predicate_count());
+        assert_eq!(m.triple_addition_count(), l.triple_addition_count());
+        assert_eq!(m.triple_removal_count(), l.triple_removal_count());
 
         let sid = m.subject_id("s0100").expect("must resolve");
         assert_eq!(Some(sid), l.subject_id("s0100"));
@@ -1694,7 +1656,7 @@ mod tests {
         assert!(!mt.is_empty());
         assert_eq!(mt, lt);
 
-        // value ranges, now block-lazy on the disk-less arm too
+        // value ranges, block-lazy on the disk-less arm too
         let lo = <String as tdb_succinct::TdbDataType>::make_entry(&"o0100");
         let hi = <String as tdb_succinct::TdbDataType>::make_entry(&"o0200");
         let mut mr: Vec<IdTriple> = m.triples_value_range(&lo, &hi).collect();
@@ -1762,6 +1724,70 @@ mod tests {
         let (m, _) = arms();
         assert_eq!(Layer::subject_id(&m, "nonexistent"), None);
         assert!(m.take_error().is_none());
+    }
+
+    /// Chain-cumulative counts must agree on both arms. These looked like they
+    /// had to be materialized-only -- computing them seemed to need every
+    /// ancestor's adjacency -- but summing the per-layer counts is a handful of
+    /// cached metadata reads.
+    #[test]
+    fn counts_agree_without_materializing() {
+        let (m, l) = arms();
+
+        assert!(m.try_triple_count().unwrap() > 0, "not vacuous");
+        assert_eq!(m.try_triple_count().unwrap(), l.try_triple_count().unwrap());
+        assert_eq!(
+            m.try_triple_addition_count().unwrap(),
+            l.try_triple_addition_count().unwrap()
+        );
+        assert_eq!(
+            m.try_triple_removal_count().unwrap(),
+            l.try_triple_removal_count().unwrap()
+        );
+        assert!(
+            m.try_triple_removal_count().unwrap() > 0,
+            "the test graph has removals, so this is not vacuous either"
+        );
+        assert_eq!(
+            m.triple_layer_addition_count().unwrap(),
+            l.triple_layer_addition_count().unwrap()
+        );
+        assert_eq!(
+            m.triple_layer_removal_count().unwrap(),
+            l.triple_layer_removal_count().unwrap()
+        );
+        // and none of that left an error behind
+        assert!(l.take_error().is_none());
+    }
+
+    /// Writing to a disk-less layer must work, by materializing on demand.
+    ///
+    /// Building a child on top of a layer inherently needs the whole layer, so
+    /// there is no block-lazy version. Refusing instead would mean a disk-less
+    /// store could not be written to at all, which would make it useless as a
+    /// drop-in store.
+    #[test]
+    fn writes_on_a_disk_less_layer_materialize_rather_than_fail() {
+        let (m, l) = arms();
+
+        let builder = l
+            .open_write()
+            .expect("a disk-less layer must still be writable");
+        builder
+            .add_value_triple(ValueTriple::new_string_value("s9999", "p", "o9999"))
+            .unwrap();
+        let child = builder.commit().unwrap();
+        assert_eq!(child.parent_name(), Some(l.name()));
+
+        // the write really landed, and is visible from a disk-less read of it
+        assert!(
+            m.rollup().is_ok(),
+            "history ops work on the materialized arm"
+        );
+        assert!(
+            l.squash().is_ok(),
+            "and on the disk-less arm, by materializing"
+        );
     }
 
     /// `into_materialized` is what keeps the not-yet-disk-less Rust readers

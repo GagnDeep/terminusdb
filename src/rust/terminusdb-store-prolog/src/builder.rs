@@ -89,7 +89,7 @@ predicates! {
         let builder: WrappedBuilder = builder_term.get_ex()?;
         let layer: WrappedLayer = layer_term.get_ex()?;
 
-        context.try_or_die(builder.apply_delta(context.try_or_die(layer.require_materialized_head())?))?;
+        context.try_or_die(builder.apply_delta(&context.try_or_die(layer.require_materialized_head())?))?;
 
         Ok(())
     }
@@ -98,7 +98,7 @@ predicates! {
         let builder: WrappedBuilder = builder_term.get_ex()?;
         let layer: WrappedLayer = layer_term.get_ex()?;
 
-        context.try_or_die(builder.apply_diff(context.try_or_die(layer.require_materialized_head())?))?;
+        context.try_or_die(builder.apply_diff(&context.try_or_die(layer.require_materialized_head())?))?;
 
         Ok(())
     }

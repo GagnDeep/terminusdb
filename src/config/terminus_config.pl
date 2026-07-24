@@ -34,6 +34,9 @@
               dashboard_enabled/0,
               parallelize_enabled/0,
               grpc_label_endpoint/1,
+              object_store_bucket/1,
+              object_store_prefix/1,
+              diskless_reads_enabled/0,
               crypto_password_cost/1,
               lru_cache_size/1,
               trust_migrations/0,
@@ -331,6 +334,44 @@ grpc_label_endpoint(Endpoint) :-
     getenv('TERMINUSDB_GRPC_LABEL_ENDPOINT', Endpoint).
 
 crypto_password_cost(10).
+
+/**
+ * object_store_bucket(-Bucket) is semidet.
+ *
+ * The S3-compatible bucket backing the triple store, or the atom `memory`
+ * for an in-process bucket. Unset means use the local archive store, so this
+ * is the switch that selects object storage at all.
+ *
+ * Credentials, region and any endpoint override are read by the object store
+ * client from the standard AWS environment variables; they are deliberately
+ * not part of this configuration and never pass through Prolog.
+ */
+:- table object_store_bucket/1.
+object_store_bucket(Bucket) :-
+    getenv('TERMINUSDB_OBJECT_STORE_BUCKET', Bucket).
+
+/**
+ * object_store_prefix(-Prefix) is det.
+ *
+ * Key prefix within the bucket. Lets several databases share one bucket.
+ */
+:- table object_store_prefix/1.
+object_store_prefix(Prefix) :-
+    getenv_default('TERMINUSDB_OBJECT_STORE_PREFIX', '', Prefix).
+
+/**
+ * diskless_reads_enabled is semidet.
+ *
+ * Read layers block-lazily -- fetching only the blocks a query touches --
+ * instead of materializing whole layers. Only meaningful together with
+ * object_store_bucket/1.
+ *
+ * Off by default: it changes the failure mode of every read (a query can now
+ * fail on a network error rather than only on bad data), so it is opt-in.
+ */
+:- table diskless_reads_enabled/0.
+diskless_reads_enabled :-
+    getenv('TERMINUSDB_DISKLESS_READS', true).
 
 :- table lru_cache_size/1.
 lru_cache_size(Cache_Size) :-
