@@ -6,6 +6,10 @@
               open_archive_store/2,
               open_archive_store/3,
               open_grpc_store/5,
+              open_object_store/4,
+              open_diskless_object_store/4,
+              store_diskless/2,
+              store_materialized/2,
 
               create_named_graph/3,
               open_named_graph/3,
@@ -139,6 +143,38 @@ terminus_store_version('0.19.8').
 %
 % @arg Path a file system path to the store directory. This can be either absolute and relative.
 % @arg Store the returned directory store.
+
+%! open_object_store(+Bucket:text, +Prefix:text, +CacheSize:integer, -Store:store) is det.
+%
+% Opens a store backed by an S3-compatible bucket, and unifies it with Store.
+% Layers are materialized as usual; only the backing storage differs.
+%
+% @arg Bucket the atom `memory` for an in-process bucket (useful in tests), or
+%      an S3 bucket name. Credentials, region and any endpoint override are read
+%      from the standard AWS environment variables and are never passed here.
+% @arg Prefix a key prefix within the bucket, so several stores can share one.
+% @arg CacheSize the in-memory layer cache size, in bytes.
+% @arg Store the returned object store.
+
+%! open_diskless_object_store(+Bucket:text, +Prefix:text, +CacheSize:integer, -Store:store) is det.
+%
+% As open_object_store/4, but layers read from this store are *disk-less*:
+% queries fetch only the blocks they touch via ranged reads, and no whole layer
+% is ever materialized.
+%
+% Writes still work: operations that inherently need a whole layer, such as
+% open_write/2, materialize it on demand.
+
+%! store_diskless(+Store:store, -DisklessStore:store) is det.
+%
+% A disk-less view of an already-open store: same bucket, same labels, same
+% layers, read block-lazily. Preferred over opening the bucket twice, which
+% would give two independent caches.
+
+%! store_materialized(+Store:store, -MaterializedStore:store) is det.
+%
+% The inverse of store_diskless/2: a view of the same store whose layers are
+% materialized.
 
 %! create_named_graph(+Store:store, +Name:text, -Graph:named_graph) is det.
 %

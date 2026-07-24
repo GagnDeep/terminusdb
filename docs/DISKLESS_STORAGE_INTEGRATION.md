@@ -383,6 +383,59 @@ including `layer_total_triple_count`, which previously would have raised.
 
 ---
 
+## 5e. Verified on a real deployment
+
+The whole stack was built and run: `make` produces the TerminusDB binary against
+this fork, and `tests/manual/diskless_object_store_e2e.sh` drives it end to end
+against MinIO.
+
+```
+== initialize (disk-less) ==
+Successfully initialised database.
+Database created: admin/diskless_e2e
+== read back, disk-less ==
+{"@id":"Person/f5-EDI3_unB-6pSi","@type":"Person","age":30,"name":"carol"}
+{"@id":"Person/hdtx_XIMMEWqgmao","@type":"Person","age":30,"name":"bob"}
+{"@id":"Person/lS1tQbcij0fRSv2i","@type":"Person","age":30,"name":"alice"}
+PASS: 3 documents, identical disk-less and materialized
+```
+
+`doc get` runs through the Rust document reader, so this is the first end-to-end
+exercise of the Phase 2 readers on a disk-less store — previously they were
+covered only through the `Layer` trait they call. Reading the same bucket
+materialized returns byte-identical documents, which is the differential result
+that matters.
+
+Two things this shook out, both of which would have made the feature unusable:
+
+- **`has_no_store/0` mis-detected an empty bucket as an initialized store.** It
+  infers "uninitialized" from an exception thrown by the *local-directory*
+  version check, which an object store never throws. It runs at startup, before
+  the CLI installs its error handler, so getting it wrong killed the process
+  with no message at all — `terminusdb --version` printed nothing. It now asks
+  the store whether the system graph exists.
+- **`store init` opened the local archive store directly**, so an object-store
+  deployment could never be initialized. It now initializes into the bucket,
+  through the materialized view since writes need whole layers.
+
+### Not supported: a local-directory bucket
+
+A `file://` backend would make this testable without MinIO, and was tried.
+`object_store`'s `LocalFileSystem` implements create-if-absent but **not the
+ETag-conditional update** the label store's compare-and-swap needs, so it can
+create a graph and then never accept a second commit. Relaxing the CAS to
+accommodate it would give up the protection against lost head updates, so the
+option was removed rather than shipped half-working. Use `memory` within a
+single process, or MinIO/S3 across processes.
+
+### Not covered
+
+WOQL through the CLI was not exercised: the query syntax was rejected before
+reaching storage, identically in both modes, so it says nothing either way about
+the disk-less path.
+
+---
+
 ## 6. Prerequisites in terminus-store — DONE
 
 - **`SyncLazyLayer::triple_additions_*` / `triple_removals_*`** (and the async

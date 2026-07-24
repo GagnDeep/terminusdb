@@ -84,8 +84,8 @@ fn get_process_rss_bytes() -> Option<usize> {
 
 /// Build the object-backed `SyncStore` shared by the two object-store openers.
 ///
-/// `bucket` is the atom `memory` for an in-process bucket (tests, and the
-/// disk-less differential tests), or an S3 bucket name. In the S3 case the
+/// `bucket` is the atom `memory` for an in-process bucket, or an S3 bucket
+/// name. In the S3 case the
 /// builder reads credentials, region and any endpoint override from the
 /// environment, so no secret ever passes through a Prolog term.
 ///
@@ -111,6 +111,13 @@ fn open_object_store_impl<C: QueryableContextType>(
         std::sync::Arc::new(InMemory::new())
     } else {
         let bucket_name: PrologText = bucket_term.get_ex()?;
+        // A `file://` local-directory backend is deliberately not offered.
+        // `object_store`'s LocalFileSystem implements create-if-absent but not
+        // the ETag-conditional update the label store's compare-and-swap needs,
+        // so it can create a graph and then never accept a second commit.
+        // Relaxing the CAS to accommodate it would give up the protection
+        // against lost head updates, which is not a trade worth making. Use
+        // `memory` for a single process, or MinIO/S3 across processes.
         let s3 = context.try_or_die_generic(
             AmazonS3Builder::from_env()
                 .with_bucket_name(&*bucket_name)
