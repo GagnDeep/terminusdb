@@ -436,6 +436,29 @@ the disk-less path.
 
 ---
 
+## 5f. Keeping reads cheap: automatic compaction — DONE
+
+Disk-less read cost scales with chain depth (~2 object-store requests per
+layer), and the read paths follow the rollup pointer, so a rolled-up graph reads
+in a handful of requests regardless of how many commits it has. Rollup is
+therefore not an optimisation to run occasionally — it is what keeps the
+disk-less path viable on a live database. So it runs automatically.
+
+- `start_compaction/3` (terminusdb-store-prolog) spawns the background rollup
+  task; `TERMINUSDB_COMPACTION_MAX_DEPTH` is the switch (unset = off) and
+  `TERMINUSDB_COMPACTION_INTERVAL_SECONDS` the cadence (default 60).
+- `maybe_start_compaction/1` runs once at server boot; a start failure is logged
+  and swallowed, never fatal.
+- Rollup-only, never squash: every original layer is retained and the parent
+  chain stays walkable, so history and the audit trail survive.
+
+Measured effect (R2, 12-layer chain): a selective query costs 25 requests
+un-compacted and **3** once rolled up. Verified on the running server: with
+`MAX_DEPTH=2` it logs the task starting, writes `.rollup.hex` files, serves reads
+correctly through the rollup, and stays off when the variable is unset.
+
+---
+
 ## 6. Prerequisites in terminus-store — DONE
 
 - **`SyncLazyLayer::triple_additions_*` / `triple_removals_*`** (and the async
