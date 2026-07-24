@@ -420,19 +420,18 @@ impl ReadLayer {
     }
 
     // ---- value ranges ----
-    //
-    // Upstream's range iterators are built on the materialized object index;
-    // there is no block-lazy equivalent yet, so disk-less range queries are
-    // rejected rather than answered incompletely.
 
     pub fn try_triples_value_range(
         &self,
         low: &TypedDictEntry,
         high: &TypedDictEntry,
     ) -> io::Result<TripleIter> {
-        Ok(self
-            .require_materialized("id_triple_value_range")?
-            .triples_value_range(low, high))
+        match self {
+            Self::Materialized(l) => Ok(l.triples_value_range(low, high)),
+            Self::Lazy(l) => Ok(Box::new(
+                l.inner().triples_value_range(low, high)?.into_iter(),
+            )),
+        }
     }
 
     pub fn try_triples_value_range_rev(
@@ -440,9 +439,12 @@ impl ReadLayer {
         low: &TypedDictEntry,
         high: &TypedDictEntry,
     ) -> io::Result<TripleIter> {
-        Ok(self
-            .require_materialized("id_triple_value_range_rev")?
-            .triples_value_range_rev(low, high))
+        match self {
+            Self::Materialized(l) => Ok(l.triples_value_range_rev(low, high)),
+            Self::Lazy(l) => Ok(Box::new(
+                l.inner().triples_value_range_rev(low, high)?.into_iter(),
+            )),
+        }
     }
 
     // ---- writes and history rewriting (materialized only) ----
@@ -631,20 +633,21 @@ impl Layer for ReadLayer {
         }
     }
 
-    /// Value ranges have no block-lazy implementation yet, so on the disk-less
-    /// arm this records `Unsupported` and yields nothing -- which the sticky
-    /// error then turns into a raised query, not an empty answer.
     fn triples_value_range(&self, low: &TypedDictEntry, high: &TypedDictEntry) -> TripleIter {
         match self {
             Self::Materialized(l) => l.triples_value_range(low, high),
-            Self::Lazy(l) => l.or_record(unsupported("triples_value_range"), empty_triples()),
+            Self::Lazy(l) => {
+                boxed(l.or_record(l.inner().triples_value_range(low, high), Vec::new()))
+            }
         }
     }
 
     fn triples_value_range_rev(&self, low: &TypedDictEntry, high: &TypedDictEntry) -> TripleIter {
         match self {
             Self::Materialized(l) => l.triples_value_range_rev(low, high),
-            Self::Lazy(l) => l.or_record(unsupported("triples_value_range_rev"), empty_triples()),
+            Self::Lazy(l) => {
+                boxed(l.or_record(l.inner().triples_value_range_rev(low, high), Vec::new()))
+            }
         }
     }
 
@@ -1635,14 +1638,9 @@ mod tests {
 
         let low = <String as tdb_succinct::TdbDataType>::make_entry(&"a");
         let high = <String as tdb_succinct::TdbDataType>::make_entry(&"z");
-        rejects!(
-            l.try_triples_value_range(&low, &high),
-            "triples_value_range"
-        );
-        rejects!(
-            l.try_triples_value_range_rev(&low, &high),
-            "triples_value_range_rev"
-        );
+        // value ranges are no longer in this list: they are block-lazy now, and
+        // both arms are compared in `layer_trait_reads_agree_on_both_arms`
+        assert!(l.try_triples_value_range(&low, &high).is_ok());
 
         // the materialized arm still answers all of these
         assert!(m.try_triple_count().unwrap() > 0);
@@ -1695,6 +1693,26 @@ mod tests {
         lt.sort();
         assert!(!mt.is_empty());
         assert_eq!(mt, lt);
+
+        // value ranges, now block-lazy on the disk-less arm too
+        let lo = <String as tdb_succinct::TdbDataType>::make_entry(&"o0100");
+        let hi = <String as tdb_succinct::TdbDataType>::make_entry(&"o0200");
+        let mut mr: Vec<IdTriple> = m.triples_value_range(&lo, &hi).collect();
+        let mut lr: Vec<IdTriple> = l.triples_value_range(&lo, &hi).collect();
+        mr.sort();
+        lr.sort();
+        assert!(!mr.is_empty(), "value-range check must not be vacuous");
+        assert!(
+            mr.len() < m.triples().count(),
+            "range must be a strict subset"
+        );
+        assert_eq!(mr, lr);
+
+        let mut mr: Vec<IdTriple> = m.triples_value_range_rev(&lo, &hi).collect();
+        let mut lr: Vec<IdTriple> = l.triples_value_range_rev(&lo, &hi).collect();
+        mr.sort();
+        lr.sort();
+        assert_eq!(mr, lr);
 
         for (a, b) in [
             (m.triples_sp(sid, pid), l.triples_sp(sid, pid)),

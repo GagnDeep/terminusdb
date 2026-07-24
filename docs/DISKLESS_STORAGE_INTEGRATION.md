@@ -196,12 +196,15 @@ All of `id_triple`, `id_triple_addition`, `id_triple_removal`, `subject_to_id`,
 `parent`, `retrieve_layer_stack_names` and `layer_equals` dispatch to whichever
 arm the layer carries.
 
-**Not routed:** `id_triple_value_range`, `id_triple_value_range_rev`, and
-`id_triple_sp_value_next/previous` — upstream range predicates that arrived after
-this plan was written. The first two are built on the materialized object index
-and have no block-lazy equivalent yet, so they raise on a disk-less layer rather
-than answer incompletely. (`sp_value_next/previous` do work disk-lessly: they are
+**Routed since the block-lazy range work:** `id_triple_value_range` and
+`id_triple_value_range_rev` also dispatch to both arms.
+(`id_triple_sp_value_next/previous` always worked disk-lessly — they are
 implemented as an `sp` scan.)
+
+**Materialized-only:** writes, history rewriting (squash/rollup), the
+chain-cumulative triple counts, and `stored_size`. A disk-less handle would have
+to load every ancestor's adjacency to compute the counts, which defeats the
+purpose, so they raise rather than being quietly slow.
 
 ### 4c. Opting in
 
@@ -387,9 +390,10 @@ three tiers below are runnable.
   in §5b: anything reading a `ReadLayer` through the `Layer` trait must call
   `check_diskless_reads` before reporting results. A new reader entry point that
   forgets to is the live hazard — the type system cannot enforce it.
-- **Value-range queries are still materialized-only.** `triples_value_range`
-  has no block-lazy implementation, so it records `Unsupported` and yields
-  nothing, which the sticky error turns into a raised query. Implementing it
-  disk-lessly is the remaining functional gap.
+- **Value-range queries are disk-less as of the block-lazy range work.** For
+  each layer in the chain the two bounds are binary-searched in that layer's
+  value dictionary and the ids between them mapped into the global id space, so
+  cost scales with the width of the range rather than the size of the
+  dictionary. No read predicate is materialized-only any more.
 - **Opt-in only.** Ship behind the disk-less store variant; the default archive/
   directory paths are unchanged, so nothing regresses for existing deployments.

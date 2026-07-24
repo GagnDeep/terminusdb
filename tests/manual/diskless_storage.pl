@@ -45,7 +45,7 @@ build(Store, Graph) :-
 
 % Everything Phase 1 routes, gathered from one layer handle.
 probe(Layer, probe(Sid,Pid,Oid,Subj,Pred,Obj,NV,PC,Stack,Exists,NotExists,
-                   NTriples,NS,NSP,NO,NP,NAdds,NRems,AddEx,RemEx)) :-
+                   NTriples,NS,NSP,NO,NP,NAdds,NRems,AddEx,RemEx,Range,RangeRev)) :-
     xsd_string(X),
     terminus_store:subject_to_id(Layer, "s0100", Sid),
     terminus_store:predicate_to_id(Layer, "p", Pid),
@@ -69,7 +69,15 @@ probe(Layer, probe(Sid,Pid,Oid,Subj,Pred,Obj,NV,PC,Stack,Exists,NotExists,
     Adds = [t(AS,AP,AO)|_],
     ( terminus_store:id_triple_addition(Layer,AS,AP,AO) -> AddEx = true ; AddEx = false ),
     Rems = [t(RS,RP,RO)|_],
-    ( terminus_store:id_triple_removal(Layer,RS,RP,RO) -> RemEx = true ; RemEx = false ).
+    ( terminus_store:id_triple_removal(Layer,RS,RP,RO) -> RemEx = true ; RemEx = false ),
+    % half-open value range [o0100, o0200) -- a strict subset, so a broken
+    % bound calculation cannot pass by returning everything
+    findall(t(S7,P7,O7),
+            terminus_store:id_triple_value_range(Layer, value("o0100", X), value("o0200", X), S7, P7, O7),
+            R0), msort(R0, Range),
+    findall(t(S8,P8,O8),
+            terminus_store:id_triple_value_range_rev(Layer, value("o0100", X), value("o0200", X), S8, P8, O8),
+            R1), msort(R1, RangeRev).
 
 main :-
     build(Store, Graph),
@@ -85,10 +93,13 @@ main :-
     probe(DLayer, DP),
 
     ( MP == DP
-    -> format("MATCH: disk-less and materialized agree on all ~w probed values~n", [20]),
-       MP = probe(_,_,_,_,_,_,NV,_,Stack,_,_,NT,_,_,_,_,NA,NR,_,_),
-       length(Stack, Depth),
-       format("  nv=~w chain-depth=~w triples=~w additions=~w removals=~w~n",[NV,Depth,NT,NA,NR])
+    -> format("MATCH: disk-less and materialized agree on all ~w probed values~n", [22]),
+       MP = probe(_,_,_,_,_,_,NV,_,Stack,_,_,NT,_,_,_,_,NA,NR,_,_,Range,_),
+       length(Stack, Depth), length(Range, NRange),
+       ( NRange > 0, NRange < NT -> true
+       ; format("FAIL: value range ~w is not a strict non-empty subset of ~w~n",[NRange,NT]), fail ),
+       format("  nv=~w chain-depth=~w triples=~w additions=~w removals=~w range=~w~n",
+              [NV,Depth,NT,NA,NR,NRange])
     ;  format("MISMATCH~n  materialized: ~w~n  disk-less   : ~w~n", [MP, DP]), fail ),
 
     % writes must be refused on the disk-less handle, loudly
