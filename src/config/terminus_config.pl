@@ -37,6 +37,8 @@
               object_store_bucket/1,
               object_store_prefix/1,
               diskless_reads_enabled/0,
+              compaction_max_depth/1,
+              compaction_interval_seconds/1,
               crypto_password_cost/1,
               lru_cache_size/1,
               trust_migrations/0,
@@ -372,6 +374,27 @@ object_store_prefix(Prefix) :-
 :- table diskless_reads_enabled/0.
 diskless_reads_enabled :-
     getenv('TERMINUSDB_DISKLESS_READS', true).
+
+/**
+ * compaction_max_depth(-Depth) is semidet.
+ *
+ * Roll a label head up once its effective layer stack exceeds Depth. Unset
+ * disables background compaction, so this is the switch. A rolled-up graph
+ * reads in a handful of object-store requests rather than ~two per layer, which
+ * is what keeps disk-less reads cheap on a deep history.
+ */
+:- table compaction_max_depth/1.
+compaction_max_depth(Depth) :-
+    getenv_number('TERMINUSDB_COMPACTION_MAX_DEPTH', Depth).
+
+/**
+ * compaction_interval_seconds(-Seconds) is det.
+ *
+ * How often the background compaction task checks each label head.
+ */
+:- table compaction_interval_seconds/1.
+compaction_interval_seconds(Seconds) :-
+    getenv_default_number('TERMINUSDB_COMPACTION_INTERVAL_SECONDS', 60, Seconds).
 
 :- table lru_cache_size/1.
 lru_cache_size(Cache_Size) :-

@@ -1086,7 +1086,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -1904,7 +1904,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -1942,7 +1942,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.2",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -2507,7 +2507,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -2710,7 +2710,7 @@ dependencies = [
 [[package]]
 name = "terminus-store"
 version = "0.21.7"
-source = "git+https://github.com/GagnDeep/terminusdb-store?branch=feat%2Fobject-store#fcb4fe24f045d43b04842d79a7b9eb2fa6cd8aae"
+source = "git+https://github.com/GagnDeep/terminusdb-store?branch=feat%2Fobject-store#8e7d3efdd6abb4f4dc5edca63270b6b6788f4520"
 dependencies = [
  "async-trait",
  "base64 0.13.1",

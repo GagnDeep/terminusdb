@@ -10,6 +10,7 @@
               open_diskless_object_store/4,
               store_diskless/2,
               store_materialized/2,
+              start_compaction/3,
 
               create_named_graph/3,
               open_named_graph/3,
@@ -175,6 +176,14 @@ terminus_store_version('0.19.8').
 %
 % The inverse of store_diskless/2: a view of the same store whose layers are
 % materialized.
+
+%! start_compaction(+Store:store, +MaxDepth:integer, +IntervalSeconds:integer) is det.
+%
+% Start a background task that rolls up any label head whose effective layer
+% stack exceeds MaxDepth, checked every IntervalSeconds. Keeps read depth
+% bounded so reads -- especially disk-less reads over an object store -- stay
+% cheap. Rollup is non-destructive: history and the per-commit audit trail are
+% preserved. Start once at server boot.
 
 %! create_named_graph(+Store:store, +Name:text, -Graph:named_graph) is det.
 %

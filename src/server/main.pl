@@ -26,7 +26,13 @@
                                        worker_amount/1,
                                        is_enterprise/0,
                                        terminusdb_version/1,
+                                       compaction_max_depth/1,
+                                       compaction_interval_seconds/1,
                                        set_memory_mode/0]).
+
+% The compaction FFI predicate is reexported by core(triple/triplestore) but
+% not propagated through core(triple), so import it directly here.
+:- use_module(library(terminus_store), [start_compaction/3]).
 
 % Sockets
 :- use_module(library(socket)).
@@ -95,7 +101,8 @@ terminus_server(Argv,Wait) :-
         set_memory_mode
     ;   true),
 
-    (   triple_store(_Store), % ensure triple store has been set up by retrieving it once
+    (   triple_store(Store), % ensure triple store has been set up by retrieving it once
+        maybe_start_compaction(Store),
         http_delete_handler(id(busy_loading)),
         welcome_banner(Server,Argv),
         foreach(post_server_startup_hook(Port),true),
@@ -124,6 +131,24 @@ print_welcome_banner(Version, ProductName, Argv, StrTime, Now, Server) :-
            [StrTime, Now, Argv]),
     format(user_error,'% Welcome to ~s, version ~s!~n',[ProductName, Version]),
     format(user_error,'% You can view your server in a browser at \'~s\'~n~n',[Server]).
+
+% Start background rollup compaction if TERMINUSDB_COMPACTION_MAX_DEPTH is set.
+% Rollup keeps read depth bounded so reads stay cheap on a deep history, and is
+% non-destructive, so history and the audit trail are preserved. A missing
+% max-depth means the feature is off; a failure to start must not stop the
+% server, so it is logged and swallowed.
+maybe_start_compaction(Store) :-
+    (   compaction_max_depth(Depth)
+    ->  compaction_interval_seconds(Interval),
+        (   catch(start_compaction(Store, Depth, Interval), E, (log_compaction_error(E), fail))
+        ->  format(user_error,
+                   '% Background rollup compaction on: max depth ~w, every ~w s~n',
+                   [Depth, Interval])
+        ;   true )
+    ;   true ).
+
+log_compaction_error(E) :-
+    format(user_error, '% Could not start background compaction: ~q~n', [E]).
 
 welcome_banner(Server,Argv) :-
     % Test utils currently reads this so watch out if you change it!

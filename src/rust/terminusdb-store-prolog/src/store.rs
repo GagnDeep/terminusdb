@@ -334,6 +334,32 @@ predicates! {
         output_id_term.unify(result_string)
     }
 
+    /// start_compaction(+Store, +MaxDepth, +IntervalSeconds)
+    ///
+    /// Start a background task that rolls up (never squashes) any label head
+    /// whose effective layer stack exceeds MaxDepth, checked every
+    /// IntervalSeconds. Keeps read depth bounded so disk-less reads stay cheap;
+    /// non-destructive, so history and the audit trail are preserved.
+    ///
+    /// Fire-and-forget: the task lives for the process, so the handle is
+    /// dropped. Start it once at server boot.
+    pub semidet fn start_compaction(context, store_term, max_depth_term, interval_secs_term) {
+        let store: WrappedStore = store_term.get_ex()?;
+        let max_depth: u64 = max_depth_term.get_ex()?;
+        let interval_secs: u64 = interval_secs_term.get_ex()?;
+        if max_depth == 0 || interval_secs == 0 {
+            return context.raise_exception(
+                &term!{context: error(domain_error(positive_integer, compaction_params), _)}?);
+        }
+        // ReadStore derefs to SyncStore; compaction runs on the materialized
+        // layers regardless of how this store reads.
+        store.spawn_compaction(
+            max_depth as usize,
+            std::time::Duration::from_secs(interval_secs),
+        );
+        Ok(())
+    }
+
     /// Get layer cache statistics: (total_entries, live_entries, dead_entries)
     /// Dead entries are stale weak references that should be cleaned up.
     pub semidet fn layer_cache_stats(_context, store_term, total_term, live_term, dead_term) {
