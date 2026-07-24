@@ -13,6 +13,10 @@ pub fn install(module: Option<&str>) {
     store::register_open_raw_archive_store_in_module(module);
     store::register_open_archive_store_in_module(module);
     store::register_open_grpc_store_in_module(module);
+    store::register_open_object_store_in_module(module);
+    store::register_open_diskless_object_store_in_module(module);
+    store::register_store_diskless_in_module(module);
+    store::register_store_materialized_in_module(module);
     named_graph::register_create_named_graph_in_module(module);
     named_graph::register_open_named_graph_in_module(module);
     named_graph::register_delete_named_graph_in_module(module);
@@ -23,6 +27,7 @@ pub fn install(module: Option<&str>) {
     named_graph::register_nb_force_set_head_version_in_module(module);
     store::register_open_write_in_module(module);
     store::register_merge_base_layers_in_module(module);
+    store::register_start_compaction_in_module(module);
     builder::register_nb_add_id_triple_in_module(module);
     builder::register_nb_add_object_triple_in_module(module);
     builder::register_nb_remove_id_triple_in_module(module);

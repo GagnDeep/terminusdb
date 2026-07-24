@@ -2,7 +2,8 @@
 use std::mem::MaybeUninit;
 
 use lazy_init::Lazy;
-use terminusdb_store_prolog::terminus_store::{store::sync::SyncStoreLayer, Layer};
+use terminusdb_store_prolog::layer::ReadLayer;
+use terminusdb_store_prolog::terminus_store::Layer;
 
 use crate::consts::{SYS_ARRAY, SYS_VALUE};
 

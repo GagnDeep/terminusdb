@@ -82,14 +82,14 @@ predicates! {
     pub semidet fn nb_commit(context, builder_term, layer_term) {
         let builder: WrappedBuilder = builder_term.get_ex()?;
         let layer = context.try_or_die(builder.commit())?;
-        layer_term.unify(WrappedLayer(layer))
+        layer_term.unify(WrappedLayer(ReadLayer::Materialized(layer)))
     }
 
     pub semidet fn nb_apply_delta(context, builder_term, layer_term) {
         let builder: WrappedBuilder = builder_term.get_ex()?;
         let layer: WrappedLayer = layer_term.get_ex()?;
 
-        context.try_or_die(builder.apply_delta(&layer))?;
+        context.try_or_die(builder.apply_delta(&context.try_or_die(layer.require_materialized_head())?))?;
 
         Ok(())
     }
@@ -98,7 +98,7 @@ predicates! {
         let builder: WrappedBuilder = builder_term.get_ex()?;
         let layer: WrappedLayer = layer_term.get_ex()?;
 
-        context.try_or_die(builder.apply_diff(&layer))?;
+        context.try_or_die(builder.apply_diff(&context.try_or_die(layer.require_materialized_head())?))?;
 
         Ok(())
     }

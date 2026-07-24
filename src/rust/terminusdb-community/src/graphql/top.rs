@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use crate::terminus_store::store::sync::*;
 use crate::terminus_store::Layer as TSLayer;
 use crate::value::*;
 use juniper::FromContext;
@@ -8,6 +7,7 @@ use tdb_succinct::*;
 
 use super::schema::SystemInfo;
 use super::schema::TerminusContext;
+use terminusdb_store_prolog::layer::ReadLayer;
 impl juniper::Context for SystemInfo {}
 
 impl<'a> FromContext<TerminusContext<'a>> for SystemInfo {
@@ -16,7 +16,7 @@ impl<'a> FromContext<TerminusContext<'a>> for SystemInfo {
     }
 }
 
-fn maybe_object_string(db: &SyncStoreLayer, id: u64, prop: &str) -> Option<String> {
+fn maybe_object_string(db: &ReadLayer, id: u64, prop: &str) -> Option<String> {
     db.predicate_id(prop)
         .and_then(|p| db.single_triple_sp(id, p))
         .and_then(|t| db.id_object(t.object))
@@ -26,7 +26,7 @@ fn maybe_object_string(db: &SyncStoreLayer, id: u64, prop: &str) -> Option<Strin
         .and_then(|j| j.as_str().map(|s| s.to_string()))
 }
 
-fn required_object_string(db: &SyncStoreLayer, id: u64, prop: &str) -> String {
+fn required_object_string(db: &ReadLayer, id: u64, prop: &str) -> String {
     let predicate_id = db
         .predicate_id(prop)
         .unwrap_or_else(|| panic!("can't find {} predicate", prop));
@@ -43,7 +43,7 @@ fn required_object_string(db: &SyncStoreLayer, id: u64, prop: &str) -> String {
     name_unprocessed.as_val::<String, String>()
 }
 
-fn required_object_float(db: &SyncStoreLayer, id: u64, prop: &str) -> f64 {
+fn required_object_float(db: &ReadLayer, id: u64, prop: &str) -> f64 {
     let predicate_id = db
         .predicate_id(prop)
         .unwrap_or_else(|| panic!("can't find {} predicate", prop));
@@ -60,7 +60,7 @@ fn required_object_float(db: &SyncStoreLayer, id: u64, prop: &str) -> f64 {
     f_unprocessed.as_val::<f64, f64>()
 }
 
-fn has_string_value(db: &SyncStoreLayer, id: u64, prop: &str, obj: &str) -> bool {
+fn has_string_value(db: &ReadLayer, id: u64, prop: &str, obj: &str) -> bool {
     let res = (|| {
         let predicate_id = db.predicate_id(prop)?;
         let object = String::make_entry(&obj);

@@ -87,6 +87,15 @@ default_triple_store(Triple_Store) :-
     lru_cache_size(Cache_Size),
     open_grpc_store(Path, Endpoint, 1, Cache_Size, Triple_Store).
 default_triple_store(Triple_Store) :-
+    object_store_bucket(Bucket),
+    !,
+    object_store_prefix(Prefix),
+    lru_cache_size(Cache_Size),
+    (   diskless_reads_enabled
+    ->  open_diskless_object_store(Bucket, Prefix, Cache_Size, Triple_Store)
+    ;   open_object_store(Bucket, Prefix, Cache_Size, Triple_Store)
+    ).
+default_triple_store(Triple_Store) :-
     db_path(Path),
     assert_database_version_is_current(Path),
     lru_cache_size(Cache_Size),

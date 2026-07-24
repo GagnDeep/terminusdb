@@ -10,7 +10,7 @@ use juniper::{
 use lazy_init::Lazy;
 use swipl::prelude::*;
 use tdb_succinct::TypedDictEntry;
-use terminusdb_store_prolog::terminus_store::store::sync::SyncStoreLayer;
+use terminusdb_store_prolog::layer::ReadLayer;
 use terminusdb_store_prolog::terminus_store::{IdTriple, Layer, ObjectType};
 
 use crate::consts::{RDF_FIRST, RDF_NIL, RDF_REST, RDF_TYPE, SYS_VALUE};
@@ -38,9 +38,9 @@ pub enum NodeOrValue {
 #[allow(dead_code)]
 pub struct SystemInfo {
     pub user: Atom,
-    pub system: SyncStoreLayer,
-    pub commit: Option<SyncStoreLayer>,
-    pub meta: Option<SyncStoreLayer>,
+    pub system: ReadLayer,
+    pub commit: Option<ReadLayer>,
+    pub meta: Option<ReadLayer>,
 }
 
 #[derive(Clone)]
@@ -51,10 +51,10 @@ pub struct TerminusContext<'a> {
     pub author_term: Term<'a>,
     pub message_term: Term<'a>,
     pub system_info: SystemInfo,
-    pub schema: SyncStoreLayer,
-    pub instance: Option<SyncStoreLayer>,
+    pub schema: ReadLayer,
+    pub instance: Option<ReadLayer>,
     pub type_collection: TerminusTypeCollectionInfo,
-    pub document_context: Arc<Lazy<DocumentContext<SyncStoreLayer>>>,
+    pub document_context: Arc<Lazy<DocumentContext<ReadLayer>>>,
 }
 
 impl<'a> TerminusContext<'a> {
@@ -108,7 +108,17 @@ impl<'a> TerminusContext<'a> {
         })
     }
 
-    pub fn document_context(&self) -> &DocumentContext<SyncStoreLayer> {
+    /// Every layer this context reads, so a caller can check whether any
+    /// disk-less read failed before reporting the query's result.
+    pub fn layers(&self) -> Vec<&ReadLayer> {
+        let mut v = vec![&self.schema, &self.system_info.system];
+        v.extend(self.instance.iter());
+        v.extend(self.system_info.commit.iter());
+        v.extend(self.system_info.meta.iter());
+        v
+    }
+
+    pub fn document_context(&self) -> &DocumentContext<ReadLayer> {
         self.document_context
             .get_or_create(|| DocumentContext::new(self.schema.clone(), self.instance.clone()))
     }
@@ -422,13 +432,8 @@ impl GraphQLValue for TerminusTypeCollection {
                 for (name, typedef) in info.allframes.frames.iter() {
                     if let TypeDefinition::Class(_) = typedef {
                         if let Some(filter) = arguments.get::<FilterInputObject>(name.as_str()) {
-                            let count = run_count_query(
-                                context,
-                                instance,
-                                &filter,
-                                name,
-                                &info.allframes,
-                            );
+                            let count =
+                                run_count_query(context, instance, &filter, name, &info.allframes);
                             return Ok(Value::scalar(count));
                         }
                     }
@@ -1076,7 +1081,7 @@ impl GraphQLValue for TerminusType {
 fn extract_fragment(
     executor: &juniper::Executor<TerminusContext<'static>, DefaultScalarValue>,
     info: &TerminusTypeInfo,
-    instance: &SyncStoreLayer,
+    instance: &ReadLayer,
     object_id: u64,
     doc_type: Option<&GraphQLName<'_>>,
     enum_type: Option<&GraphQLName<'_>>,
@@ -1111,7 +1116,7 @@ pub fn enum_type_and_node_to_iri_name(enum_type: &IriName, enum_uri: &IriName) -
 
 fn extract_enum_fragment(
     info: &TerminusTypeInfo,
-    instance: &SyncStoreLayer,
+    instance: &ReadLayer,
     object_id: u64,
     enum_type: &GraphQLName<'_>,
 ) -> juniper::Value {
@@ -1125,7 +1130,7 @@ fn extract_enum_fragment(
 }
 
 fn extract_json_fragment(
-    instance: &SyncStoreLayer,
+    instance: &ReadLayer,
     object_id: u64,
 ) -> Result<juniper::Value, juniper::FieldError> {
     // TODO this should really not just recreate a context, but it's cheap enough since it is schema independent.
@@ -1136,7 +1141,7 @@ fn extract_json_fragment(
         // Primitives and arrays have @value key (and possibly only @value)
         // Objects have actual field keys without @value wrapper
         let is_primitive_or_array = doc.contains_key("@value") && doc.len() <= 2;
-        
+
         let json = if is_primitive_or_array {
             // For primitives and arrays, extract just the @value content
             doc.remove("@value").unwrap()
@@ -1303,7 +1308,7 @@ fn collect_into_graphql_list<'a>(
     info: &'a TerminusTypeInfo,
     arguments: &'a juniper::Arguments,
     object_ids: ClonableIterator<'a, u64>,
-    instance: &'a SyncStoreLayer,
+    instance: &'a ReadLayer,
 ) -> Option<Result<Value, juniper::FieldError>> {
     if let Some(doc_type) = doc_type {
         let object_ids = match executor.context().instance.as_ref() {
@@ -1520,17 +1525,25 @@ where
     fn resolve(&self) -> juniper::Value {
         // Debug: Write to file to confirm this code runs
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/bigfloat_resolve.log") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/bigfloat_resolve.log")
+        {
             let _ = writeln!(f, "BigFloat::resolve called with value: {}", self.0);
         }
-        
+
         // Use marker for post-processing to JSON number with 20-digit precision
         let marker = format!("__TERMINUS_NUM__{}", self.0);
-        
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/bigfloat_resolve.log") {
+
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/bigfloat_resolve.log")
+        {
             let _ = writeln!(f, "Created marker: {}", marker);
         }
-        
+
         juniper::Value::scalar(marker)
     }
 

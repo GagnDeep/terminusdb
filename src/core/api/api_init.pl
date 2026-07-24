@@ -119,6 +119,17 @@ graphiql_template_path(Path) :-
 config_path(Path) :-
     once(expand_file_search_path(config('terminus_config.pl'), Path)).
 
+initialize_database(Key,_Force) :-
+    % An object-store deployment has no local storage directory and no
+    % on-disk version marker, so there is nothing to create, clear or
+    % version-check: initialize straight into the bucket. Writes need
+    % materialized layers, so use the materialized view even when reads are
+    % configured to be disk-less.
+    object_store_bucket(_),
+    !,
+    default_triple_store(Configured_Store),
+    store_materialized(Configured_Store, Store),
+    initialize_database_with_store(Key, Store).
 initialize_database(Key,Force) :-
     db_path(DB_Path),
     initialize_database_with_path(Key, DB_Path, Force).
@@ -201,6 +212,19 @@ current_woql_version("v1.0.3").
 current_repository_version("v1.0.1").
 current_ref_version("v1.0.2").
 
+has_no_store :-
+    % An object store has no on-disk version marker, so the exception the
+    % local-directory branch relies on below is never thrown and every empty
+    % bucket would look like an initialized store. Ask the store instead:
+    % uninitialized means the system graph is not there yet.
+    %
+    % This runs at startup, before the error handler is installed, so getting
+    % it wrong makes the process die without a message.
+    object_store_bucket(_),
+    !,
+    triple_store(Store),
+    system_schema_name(Schema_Name),
+    \+ safe_named_graph_exists(Store, Schema_Name).
 has_no_store :-
     catch(
         (   triple_store(_),

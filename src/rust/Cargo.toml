@@ -9,9 +9,11 @@ debug = true
 #tdb-succinct = {path="../../../tdb-succinct"}
 tdb-succinct = {git="https://github.com/terminusdb-org/tdb-succinct"}
 #terminus-store = {path="../../../terminusdb-store"}
-terminus-store = {git="https://github.com/terminusdb-org/terminusdb-store"}
+# Disk-less object-store work lives on the fork. This covers the transitive
+# crates.io dependants (terminusdb-grpc-labelstore-client); the direct git
+# dependency in terminusdb-store-prolog is repointed in its own manifest, so
+# that both edges unify on a single terminus-store copy.
+#terminus-store = {git="https://github.com/terminusdb-org/terminusdb-store"}
+terminus-store = {git="https://github.com/GagnDeep/terminusdb-store", branch="feat/object-store"}
 swipl = {git="https://github.com/terminusdb-org/swipl-rs"}
 #swipl = {path="../../../swipl-rs/swipl"}
-
-#[patch."https://github.com/terminusdb-org/terminusdb-store"]
-#terminus-store = {path="../../../terminusdb-store"}

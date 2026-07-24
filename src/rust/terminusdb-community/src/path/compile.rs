@@ -13,11 +13,11 @@ use crate::graphql::frame::{AllFrames, Prefixes};
 use crate::graphql::query::predicate_value_filter;
 use crate::graphql::schema::NodeOrValue;
 use crate::terminus_store::layer::*;
-use crate::terminus_store::store::sync::SyncStoreLayer;
+use terminusdb_store_prolog::layer::ReadLayer;
 
 pub fn path_to_class<'a, 'b>(
     path_string: &'b str,
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     to_class: &'a GraphQLName<'a>,
     all_frames: &'a AllFrames,
     zero_iter: ClonableIterator<'a, u64>,
@@ -33,7 +33,7 @@ pub fn path_to_class<'a, 'b>(
 }
 
 pub fn compile_path<'a>(
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     prefixes: Prefixes,
     path: Path,
     mut iter: ClonableIterator<'a, u64>,
@@ -146,7 +146,7 @@ pub fn compile_path<'a>(
 
 #[derive(Clone)]
 struct ManySearchIterator<'a> {
-    graph: &'a SyncStoreLayer,
+    graph: &'a ReadLayer,
     prefixes: Prefixes,
     start: usize,
     stop: Option<usize>,
@@ -194,7 +194,7 @@ impl<'a> Iterator for ManySearchIterator<'a> {
 }
 
 fn compile_many<'a>(
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     prefixes: Prefixes,
     path: Rc<Path>,
     iterator: ClonableIterator<'a, u64>,
@@ -294,6 +294,7 @@ mod tests {
 
         let p = parse_path("b*").unwrap().1;
         let id = layer.object_node_id("http://base/a").unwrap();
+        let layer = ReadLayer::Materialized(layer);
         let path_iter = compile_path(
             &layer,
             prefixes,
@@ -357,6 +358,7 @@ mod tests {
 
         let p = parse_path("b*,e").unwrap().1;
         let id = layer.object_node_id("http://base/a").unwrap();
+        let layer = ReadLayer::Materialized(layer);
         let path_iter = compile_path(
             &layer,
             prefixes,
@@ -416,6 +418,7 @@ mod tests {
 
         let p = parse_path("b,<e,b*").unwrap().1;
         let id = layer.object_node_id("http://base/a").unwrap();
+        let layer = ReadLayer::Materialized(layer);
         let path_iter = compile_path(
             &layer,
             prefixes,
