@@ -4,7 +4,6 @@ use juniper::{
     DefaultScalarValue, Definition, EmptyMutation, EmptySubscription, ExecutionError, GraphQLError,
     InputValue, RootNode, Value,
 };
-use terminusdb_store_prolog::terminus_store::Layer;
 
 use lazy_static::lazy_static;
 use lru::LruCache;
@@ -37,7 +36,7 @@ pub mod schema;
 mod system;
 mod top;
 
-use crate::types::{transaction_instance_layer, transaction_schema_layer};
+use crate::types::{check_diskless_reads, transaction_instance_layer, transaction_schema_layer};
 
 use self::{
     frame::{AllFrames, UncleanAllFrames},
@@ -118,6 +117,11 @@ impl GraphQLExecutionContext {
 
     pub fn prolog_context(&self) -> &GenericQueryableContext<'static> {
         &self.context.context
+    }
+
+    /// The layers this execution read; see `check_diskless_reads`.
+    pub fn layers(&self) -> Vec<&terminusdb_store_prolog::layer::ReadLayer> {
+        self.context.layers()
     }
 
     pub fn execute_query<T, F: Fn(&GraphQLResponse) -> T>(
@@ -213,7 +217,7 @@ predicates! {
 
         let type_collection: TerminusTypeCollectionInfo = graphql_context_term.get_ex()?;
         let execution_context = unsafe {GraphQLExecutionContext::new_from_context_terms(type_collection, context, auth_term, system_term, meta_term, commit_term, transaction_term, author_term, message_term)? };
-        execution_context.execute_query(request,
+        let result = execution_context.execute_query(request,
                                         |response: &GraphQLResponse| {
                                             let errored = response.inner_ref().as_ref()
                                                 .map(|(_, errors)|!errors.is_empty())
@@ -223,7 +227,7 @@ predicates! {
                                                 Ok(r) => {
                                                     use std::io::Write;
                                                     use chrono::Utc;
-                                                    
+
                                                     // Debug: Log to single file with timestamp per entry
                                                     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/graphql_debug.log") {
                                                         let timestamp = Utc::now().to_rfc3339();
@@ -231,21 +235,26 @@ predicates! {
                                                         let _ = writeln!(f, "{}", &r[..1000.min(r.len())]);
                                                         let _ = writeln!(f, "Contains marker: {}", r.contains("__TERMINUS_NUM__"));
                                                     }
-                                                    
+
                                                     // Post-process to convert high-precision markers to JSON numbers
                                                     let processed = post_process_graphql_numbers(r.clone());
-                                                    
+
                                                     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/graphql_debug.log") {
                                                         let _ = writeln!(f, "=== AFTER POST-PROCESS ===");
                                                         let _ = writeln!(f, "{}", &processed[..1000.min(processed.len())]);
                                                         let _ = writeln!(f, "Changed: {}", processed != r);
                                                     }
-                                                    
+
                                                     response_term.unify(processed)
                                                 },
                                                 Err(_) => return context.raise_exception(&term!{context: error(json_serialize_error, _)}?),
                                             }
-                                        })
+                                        });
+        // A disk-less read that failed produced an empty result rather than an
+        // error; surface it now so the response is discarded instead of being
+        // reported as complete.
+        check_diskless_reads(context, &execution_context.layers())?;
+        result
     }
 
     #[module("$graphql")]
@@ -272,6 +281,7 @@ predicates! {
                                                 ());
         let system_data = SystemData { user, system };
         let response = request.execute_sync(&root_node, &system_data);
+        check_diskless_reads(context, &[&system_data.system])?;
         match serde_json::to_string(&response){
             Ok(r) => {
                 // Post-process to convert high-precision markers to JSON numbers

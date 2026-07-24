@@ -6,7 +6,6 @@ use std::io::Write;
 use std::iter::Peekable;
 use std::sync::{mpsc, Arc};
 
-use crate::terminus_store::store::sync::*;
 use crate::terminus_store::*;
 
 use lazy_init::Lazy;
@@ -22,6 +21,7 @@ use super::value::*;
 use lazy_static::lazy_static;
 use rayon::prelude::*;
 use swipl::prelude::*;
+use terminusdb_store_prolog::layer::ReadLayer;
 
 pub struct DocumentContext<L: Layer + Clone> {
     schema: Option<L>,
@@ -45,6 +45,12 @@ pub struct DocumentContext<L: Layer + Clone> {
 }
 
 impl<L: Layer + Clone> DocumentContext<L> {
+    /// Every layer this context reads, so a caller can check whether any
+    /// disk-less read failed before reporting results.
+    pub fn layers(&self) -> Vec<&L> {
+        self.schema.iter().chain(self.layer.iter()).collect()
+    }
+
     pub fn new(schema: L, instance: Option<L>) -> DocumentContext<L> {
         let schema_rdf = RdfIds::new(Some(schema.clone()));
         let schema_sys = Arc::new(SysIds::new(Some(schema.clone())));
@@ -287,7 +293,7 @@ impl<L: Layer + Clone> DocumentContext<L> {
         } else {
             key.to_string()
         };
-        
+
         // add a field, but if the field is already there, make it a collection
         match obj.entry(&actual_key) {
             map::Entry::Vacant(e) => {
@@ -402,9 +408,7 @@ impl<L: Layer + Clone> DocumentContext<L> {
                 let should_unfold = self.unfoldables.contains(&t.object) || field_level_unfold;
 
                 if terminate
-                    && (!unfold
-                        || (self.document_types.contains(&t.object)
-                            && !should_unfold))
+                    && (!unfold || (self.document_types.contains(&t.object) && !should_unfold))
                 {
                     return Err(Value::String(id_name_contracted));
                 }
@@ -461,7 +465,9 @@ impl<L: Layer + Clone> DocumentContext<L> {
 
         let mut stack = Vec::new();
 
-        if let Ok((doc, type_id, fields, json)) = self.get_doc_stub(id, false, compress, unfold, None, None) {
+        if let Ok((doc, type_id, fields, json)) =
+            self.get_doc_stub(id, false, compress, unfold, None, None)
+        {
             stack.push(StackEntry::Document {
                 id,
                 doc,
@@ -773,7 +779,7 @@ impl<'a, L: Layer + Clone> StackEntry<'a, L> {
                     // Check if this is a sys:JSON primitive/array with @value wrapper
                     // Primitives and arrays have @value key (and possibly only @value and @id)
                     let is_primitive_or_array = doc.contains_key("@value") && doc.len() <= 2;
-                    
+
                     if is_primitive_or_array {
                         // For primitives and arrays, extract just the @value content
                         let mut doc = doc;
@@ -785,7 +791,7 @@ impl<'a, L: Layer + Clone> StackEntry<'a, L> {
                 } else {
                     Value::Object(doc)
                 }
-            },
+            }
             Self::List { collect, .. } => Value::Array(collect),
             Self::Array { .. } => panic!("cannot directly turn array into a value"),
         }
@@ -919,7 +925,7 @@ fn collect_array(mut elements: Vec<(Vec<usize>, Value)>) -> Value {
 wrapped_arc_blob!(
     "GetDocumentContext",
     DocumentContextBlob,
-    DocumentContext<SyncStoreLayer>,
+    DocumentContext<ReadLayer>,
     defaults
 );
 
@@ -1220,6 +1226,7 @@ fn par_print_documents_by_id<C: QueryableContextType, L: Layer + Clone + 'static
 }
 
 use super::types::*;
+use crate::types::check_diskless_reads;
 predicates! {
     #[module("$doc")]
     semidet fn get_document_context(context, transaction_term, context_term) {
@@ -1280,7 +1287,11 @@ predicates! {
             return Ok(())
         }
 
-        print_documents_of_types(context, &doc_context, stream_term, skip_term, count_term, as_list_term, types.as_slice(), compress, unfold, minimize)
+        let result = print_documents_of_types(context, &doc_context, stream_term, skip_term, count_term, as_list_term, types.as_slice(), compress, unfold, minimize);
+        // A disk-less read that failed yielded an empty result rather than an
+        // error; surface it before these documents are treated as complete.
+        check_diskless_reads(context, &doc_context.layers())?;
+        result
     }
 
     #[module("$doc")]
@@ -1301,7 +1312,11 @@ predicates! {
             return Ok(())
         }
 
-        par_print_documents_of_types(context, &doc_context.0, stream_term, skip_term, count_term, as_list_term, types, compress, unfold, minimize)
+        let result = par_print_documents_of_types(context, &doc_context.0, stream_term, skip_term, count_term, as_list_term, types, compress, unfold, minimize);
+        // A disk-less read that failed yielded an empty result rather than an
+        // error; surface it before these documents are treated as complete.
+        check_diskless_reads(context, &doc_context.layers())?;
+        result
     }
 
     #[module("$doc")]
@@ -1320,7 +1335,11 @@ predicates! {
         };
         types.sort();
 
-        print_documents_of_types(context, &doc_context, stream_term, skip_term, count_term, as_list_term, types.iter(), compress, unfold, minimize)
+        let result = print_documents_of_types(context, &doc_context, stream_term, skip_term, count_term, as_list_term, types.iter(), compress, unfold, minimize);
+        // A disk-less read that failed yielded an empty result rather than an
+        // error; surface it before these documents are treated as complete.
+        check_diskless_reads(context, &doc_context.layers())?;
+        result
     }
 
     #[module("$doc")]
@@ -1340,7 +1359,11 @@ predicates! {
         };
         types.sort();
 
-        par_print_documents_of_types(context, &doc_context.0, stream_term, skip_term, count_term, as_list_term, types, compress, unfold, minimize)
+        let result = par_print_documents_of_types(context, &doc_context.0, stream_term, skip_term, count_term, as_list_term, types, compress, unfold, minimize);
+        // A disk-less read that failed yielded an empty result rather than an
+        // error; surface it before these documents are treated as complete.
+        check_diskless_reads(context, &doc_context.layers())?;
+        result
     }
 
     #[module("$doc")]
@@ -1353,7 +1376,11 @@ predicates! {
         let unfold: bool = unfold_term.get()?;
         let minimize: bool = minimize_term.get()?;
 
-        print_documents_by_id(context, &doc_context.0, stream_term, skip_term, count_term, as_list_term, ids_term, compress, unfold, minimize)
+        let result = print_documents_by_id(context, &doc_context.0, stream_term, skip_term, count_term, as_list_term, ids_term, compress, unfold, minimize);
+        // A disk-less read that failed yielded an empty result rather than an
+        // error; surface it before these documents are treated as complete.
+        check_diskless_reads(context, &doc_context.layers())?;
+        result
     }
 
     #[module("$doc")]
@@ -1366,7 +1393,11 @@ predicates! {
         let unfold: bool = unfold_term.get()?;
         let minimize: bool = minimize_term.get()?;
 
-        par_print_documents_by_id(context, &doc_context.0, stream_term, skip_term, count_term, as_list_term, ids_term, compress, unfold, minimize)
+        let result = par_print_documents_by_id(context, &doc_context.0, stream_term, skip_term, count_term, as_list_term, ids_term, compress, unfold, minimize);
+        // A disk-less read that failed yielded an empty result rather than an
+        // error; surface it before these documents are treated as complete.
+        check_diskless_reads(context, &doc_context.layers())?;
+        result
     }
 }
 

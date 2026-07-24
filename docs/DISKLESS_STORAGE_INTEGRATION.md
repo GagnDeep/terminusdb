@@ -260,22 +260,74 @@ open_write on a disk-less layer raised:
 
 ---
 
-## 5. Integration — Phase 2 (Rust GraphQL/document readers)
+## 5. Integration — Phase 2 — DONE
 
-The Rust readers (`terminusdb-community/src/graphql/query.rs`, `top.rs`,
-`system.rs`, `doc/*`, `schema.rs`, `path/compile.rs`, `changes.rs`) take a concrete
-`&SyncStoreLayer`. To let them read disk-lessly, make them generic over a small
-read trait both `SyncStoreLayer` and `SyncLazyLayer` implement (they already call
-only trait-shaped methods, so the recon flagged this as mechanical). Two sub-tasks:
+The Rust readers (GraphQL, documents, path queries, change detection) now read
+through whichever arm the layer carries.
 
-1. Define the trait in terminus-store (or a local newtype) covering the read
-   methods these files use; impl it for both handles. Decide the error policy
-   (the trait can return `io::Result` and callers `?`-propagate, or a fallible
-   iterator).
-2. Change `transaction_instance_layer`/`transaction_schema_layer`
-   (`terminusdb-community/src/types.rs:10/29`) and the readers to be generic.
+### 5a. A concrete type, not a type parameter
 
-Phase 2 is larger and can follow Phase 1 once the Prolog path is proven.
+The plan proposed making the readers generic over a read trait. That turned out
+to be unnecessary: the readers only ever call `Layer` trait methods, so
+implementing `Layer` for `ReadLayer` and **swapping the concrete type**
+`SyncStoreLayer` → `ReadLayer` reaches the same place without threading a type
+parameter through juniper's generated code. Nine files, one type.
+
+### 5b. The error policy — a sticky error
+
+`Layer` is infallible: it was designed for a layer already resident in RAM,
+where a read is a pointer chase. A disk-less layer reads over the network, and
+there is no honest infallible answer when that fails.
+
+`DisklessLayer` resolves this with a sticky error. A failed read records its
+error and yields an empty/`None` result; the query boundary then calls
+`check_diskless_reads`, which turns the record back into an exception, and the
+whole result is discarded. **A disk-less query either returns a fully correct
+answer or raises — it never returns a partial one dressed up as complete.**
+
+Only the first error is kept (later ones are usually consequences), and the sink
+is shared by every clone, so results still funnel back to one place when a reader
+hands copies to worker threads — the document reader parallelizes with rayon.
+
+Two supporting facts make this safe rather than merely hopeful:
+
+- Many readers do `layer.id_subject(id).expect(...)`. On a failed disk-less read
+  that `None` panics — but `predicates!` wraps every body in
+  `prolog_catch_unwind`, so it surfaces as a Prolog exception, not an abort.
+  Loud, which is the point.
+- The remaining risk is a reader that *tolerates* an empty result and returns
+  successfully. That is exactly what `check_diskless_reads` covers.
+
+Checks are installed at all 15 reader entry points: the two GraphQL executions,
+the seven document printers, the delete-all path, and the change-detection
+predicates.
+
+### 5c. Method-name collision — the one real trap
+
+`ReadLayer`'s inherent fallible methods (`subject_id -> io::Result<Option<u64>>`)
+would **shadow** the identically-named `Layer` trait methods, silently giving the
+readers the wrong ones. Inherent methods win over trait methods in Rust, so this
+is not a compile error at the definition site — it surfaced only as type errors
+deep in the readers.
+
+The fallible API is therefore named `try_*` (`try_subject_id`, `try_triples_sp`,
+…). The Prolog predicates use those; anything reading through `Layer` gets the
+trait methods. The naming also makes the distinction visible at each call site.
+
+### Verification
+
+`layer_trait_reads_agree_on_both_arms` exercises the trait surface the readers
+actually use — including `single_triple_sp`, the hottest call in the readers —
+against a materialized layer over a base+child chain.
+
+`a_failed_disk_less_read_is_recorded_not_silently_empty` pins the safety
+property: a read against a layer that does not exist returns empty *and* records
+`NotFound`, taking clears it, and a materialized layer never records anything.
+
+Not yet exercised: a full GraphQL or document query end to end against a
+disk-less store. That needs a populated TerminusDB transaction, which is a
+server-level fixture rather than a unit test. The readers are covered through the
+trait they call, not through a live query.
 
 ---
 
@@ -331,6 +383,13 @@ three tiers below are runnable.
   query concurrency this approaches S3's ~5,500 GET/s-per-prefix cap. If the
   benchmark's requests/s figure hits it, add request coalescing in terminus-store
   before rolling out broadly.
-- **GraphQL stays materialized until Phase 2** — acceptable; document it.
+- **GraphQL is disk-less as of Phase 2**, subject to the sticky-error contract
+  in §5b: anything reading a `ReadLayer` through the `Layer` trait must call
+  `check_diskless_reads` before reporting results. A new reader entry point that
+  forgets to is the live hazard — the type system cannot enforce it.
+- **Value-range queries are still materialized-only.** `triples_value_range`
+  has no block-lazy implementation, so it records `Unsupported` and yields
+  nothing, which the sticky error turns into a raised query. Implementing it
+  disk-lessly is the remaining functional gap.
 - **Opt-in only.** Ship behind the disk-less store variant; the default archive/
   directory paths are unchanged, so nothing regresses for existing deployments.

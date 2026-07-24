@@ -1,12 +1,13 @@
 use juniper::{graphql_interface, graphql_object, GraphQLEnum};
 use swipl::prelude::Atom;
-use terminusdb_store_prolog::terminus_store::{store::sync::SyncStoreLayer, Layer};
+use terminusdb_store_prolog::layer::ReadLayer;
+use terminusdb_store_prolog::terminus_store::Layer;
 
 use crate::value::value_to_json;
 
 pub struct SystemData {
     pub user: Atom,
-    pub system: SyncStoreLayer,
+    pub system: ReadLayer,
 }
 impl juniper::Context for SystemData {}
 
@@ -260,7 +261,7 @@ impl Role {
     }
 }
 
-fn required_object_string(db: &SyncStoreLayer, id: u64, prop: &str) -> String {
+fn required_object_string(db: &ReadLayer, id: u64, prop: &str) -> String {
     let predicate_id = db
         .predicate_id(prop)
         .unwrap_or_else(|| panic!("can't find {} predicate", prop));
@@ -355,7 +356,7 @@ fn action_enum(action: &str) -> Action {
     }
 }
 
-fn maybe_object_string(db: &SyncStoreLayer, id: u64, prop: &str) -> Option<String> {
+fn maybe_object_string(db: &ReadLayer, id: u64, prop: &str) -> Option<String> {
     db.predicate_id(prop)
         .and_then(|p| db.single_triple_sp(id, p))
         .and_then(|t| db.id_object(t.object))

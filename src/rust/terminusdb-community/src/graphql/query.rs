@@ -11,7 +11,7 @@ use crate::consts::{RDF_FIRST, RDF_NIL, RDF_REST, SYS_VALUE};
 use crate::path::iterator::{CachedClonableIterator, ClonableIterator};
 use crate::path::{Path, Pred};
 use crate::schema::RdfListIterator;
-use crate::terminus_store::store::sync::SyncStoreLayer;
+use terminusdb_store_prolog::layer::ReadLayer;
 
 use crate::value::{base_type_kind, value_to_bigint, value_to_string, BaseTypeKind};
 use crate::{consts::RDF_TYPE, terminus_store::*};
@@ -512,7 +512,7 @@ fn compile_filter_object(
 }
 
 pub fn predicate_value_filter<'a, 'b>(
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     property: &'a str,
     object: NodeOrValue,
     iter: ClonableIterator<'a, u64>,
@@ -539,7 +539,7 @@ where
 }
 
 pub fn predicate_value_iter<'a>(
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     property: &'a str,
     object: &NodeOrValue,
 ) -> ClonableIterator<'a, u64> {
@@ -575,7 +575,7 @@ Supposing we have a filter query of the following form:
  */
 
 fn object_type_filter<'a>(
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     filter_type: &'a FilterValue,
     iter: ClonableIterator<'a, u64>,
 ) -> ClonableIterator<'a, u64> {
@@ -704,13 +704,14 @@ fn object_type_filter<'a>(
             let g = g.clone();
             // Use TypedDictEntry ordering for dateTimeInterval (binary sorts chronologically)
             let interval_entry = if type_str == "dateTimeInterval" {
-                parse_iso_interval(&val).ok().map(|iv| DateTimeInterval::make_entry(&iv))
+                parse_iso_interval(&val)
+                    .ok()
+                    .map(|iv| DateTimeInterval::make_entry(&iv))
             } else {
                 None
             };
             ClonableIterator::new(iter.filter(move |object| {
-                let object_value =
-                    g.id_object_value(*object).expect("Object value must exist");
+                let object_value = g.id_object_value(*object).expect("Object value must exist");
                 let cmp = if let Some(ref entry) = interval_entry {
                     object_value.cmp(entry)
                 } else {
@@ -757,7 +758,7 @@ fn object_type_filter<'a>(
 
 fn compile_query<'a>(
     context: &'a TerminusContext<'static>,
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     all_frames: &'a AllFrames,
     filter: Rc<FilterObject>,
     iter: ClonableIterator<'a, u64>,
@@ -919,7 +920,7 @@ fn compile_query<'a>(
 }
 
 fn collection_kind_iterator(
-    g: &SyncStoreLayer,
+    g: &ReadLayer,
     kind: CollectionKind,
     subject: u64,
     property_id: u64,
@@ -977,7 +978,7 @@ impl<'a> std::ops::Deref for PathEdgeType<'a> {
 }
 
 fn generate_iterator_from_filter<'a>(
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     class_name: &'a GraphQLName<'a>,
     all_frames: &AllFrames,
     filter_opt: Option<&FilterObject>,
@@ -1076,7 +1077,7 @@ fn path_from_components(pet: PathEdgeType) -> Path {
 }
 
 fn iterator_from_path_and_ids<'a>(
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     prefixes: &Prefixes,
     components: Vec<PathEdgeType>,
     ids: impl Iterator<Item = u64> + 'a + Clone,
@@ -1133,7 +1134,7 @@ impl<'a> PathEdgeType<'a> {
 }
 
 fn generate_iterator_from_edges<'a, 'b>(
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     prefixes: &Prefixes,
     cur: &(Vec<PathEdgeType<'b>>, &FilterObject),
 ) -> Option<ClonableIterator<'a, u64>> {
@@ -1167,7 +1168,7 @@ fn generate_iterator_from_edges<'a, 'b>(
 }
 
 fn generate_initial_iterator<'a>(
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     class_name: &'a GraphQLName<'a>,
     all_frames: &AllFrames,
     filter_opt: Option<FilterObject>,
@@ -1211,7 +1212,7 @@ fn generate_initial_iterator<'a>(
 
 fn lookup_by_filter<'a>(
     context: &'a TerminusContext<'static>,
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     class_name: &'a GraphQLName<'a>,
     all_frames: &'a AllFrames,
     filter_opt: Option<FilterObject>,
@@ -1236,7 +1237,7 @@ fn lookup_by_filter<'a>(
 
 pub fn run_filter_query<'a>(
     context: &'a TerminusContext<'static>,
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     arguments: &'a juniper::Arguments,
     class_name: &'a GraphQLName<'a>,
     all_frames: &'a AllFrames,
@@ -1353,7 +1354,7 @@ pub fn run_filter_query<'a>(
 /// Run a count query - returns count of matching documents without collecting them
 pub fn run_count_query<'a>(
     context: &'a TerminusContext<'static>,
-    g: &'a SyncStoreLayer,
+    g: &'a ReadLayer,
     filter_input: &FilterInputObject,
     class_name: &'a GraphQLName<'a>,
     all_frames: &'a AllFrames,
@@ -1368,8 +1369,8 @@ pub fn run_count_query<'a>(
         class_name,
         all_frames,
         Some(filter),
-        None,  // no zero_iter
-        true,  // include_children (matches default query behavior)
+        None, // no zero_iter
+        true, // include_children (matches default query behavior)
     )
     .count();
 
@@ -1381,7 +1382,7 @@ fn include_children(arguments: &juniper::Arguments) -> bool {
 }
 
 fn create_query_order_key(
-    g: &SyncStoreLayer,
+    g: &ReadLayer,
     all_frames: &AllFrames,
     class: &GraphQLName,
     id: u64,

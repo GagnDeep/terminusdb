@@ -4,15 +4,14 @@ use std::{
 };
 
 use swipl::{atom, predicates, prelude::Atom, result::PrologError};
-use terminusdb_store_prolog::terminus_store::store::sync::SyncStoreLayer;
+use terminusdb_store_prolog::layer::ReadLayer;
 
 use crate::{
     consts::{RdfIds, SysIds, RDF_TYPE, SYS_JSON_DOCUMENT},
     schema::SchemaQueryContext,
     terminus_store::Layer,
-    types::{transaction_instance_layer, transaction_schema_layer},
+    types::{check_diskless_reads, transaction_instance_layer, transaction_schema_layer},
 };
-
 
 #[derive(Debug)]
 pub enum ChangeType {
@@ -53,8 +52,8 @@ fn is_document_type(
 }
 
 pub fn changed_document_ids(
-    schema: &SyncStoreLayer,
-    instance: &SyncStoreLayer,
+    schema: &ReadLayer,
+    instance: &ReadLayer,
 ) -> io::Result<Vec<(u64, ChangeType)>> {
     let schema_rdf = RdfIds::new(Some(schema.clone()));
     let schema_sys = SysIds::new(Some(schema.clone()));
@@ -150,8 +149,7 @@ pub fn changed_document_ids(
                 visited.insert(parent_id);
                 current = parent_id;
 
-                if let Some(parent_type_triple) =
-                    instance.single_triple_sp(parent_id, rdf_type_id)
+                if let Some(parent_type_triple) = instance.single_triple_sp(parent_id, rdf_type_id)
                 {
                     let parent_type = parent_type_triple.object;
                     if is_document_type(parent_type, json_document_id, &document_type_ids) {
@@ -174,7 +172,7 @@ pub fn changed_document_ids(
 
 struct State {
     changes: Vec<(u64, ChangeType)>,
-    layer: SyncStoreLayer,
+    layer: ReadLayer,
 }
 
 predicates! {
@@ -186,6 +184,7 @@ predicates! {
             match (schema_layer, instance_layer) {
                 (Some(schema_layer), Some(instance_layer)) => {
                     let changes = context.try_or_die(changed_document_ids(&schema_layer, &instance_layer))?;
+                    check_diskless_reads(context, &[&schema_layer, &instance_layer])?;
                     Ok(Some(State { changes, layer: instance_layer }))
                 },
                 _ => Err(PrologError::Failure)
@@ -195,6 +194,7 @@ predicates! {
             let State{changes, layer} = state;
             if let Some((id, change_type)) = changes.pop() {
                 let iri = layer.id_subject(id).expect("id was not in dictionary");
+                check_diskless_reads(context, &[layer])?;
                 id_term.unify(iri)?;
                 change_type_term.unify(change_type.as_atom())?;
 
@@ -230,6 +230,7 @@ predicates! {
                     }
                 }
 
+                check_diskless_reads(context, &[&schema_layer, &instance_layer])?;
                 added_term.unify(added.as_slice())?;
                 changed_term.unify(changed.as_slice())?;
                 deleted_term.unify(deleted.as_slice())?;

@@ -110,7 +110,7 @@ impl ReadNamedGraph {
         if self.diskless {
             // The head is already known to exist -- it was just read from the
             // label -- so no existence check is needed here.
-            ReadLayer::Lazy(self.store.lazy_layer(layer.name()))
+            ReadLayer::Lazy(DisklessLayer::new(self.store.lazy_layer(layer.name())))
         } else {
             ReadLayer::Materialized(layer)
         }
