@@ -155,13 +155,13 @@ Verified: the full workspace builds and all 39 Rust tests pass against the fork.
 
 ---
 
-## 4. Integration — Phase 1 (Prolog/WOQL path, highest leverage, contained)
+## 4. Integration — Phase 1 — DONE
 
-Goal: an **opt-in** disk-less store whose layers answer `id_triple` and the
-converters block-lazily, transparent to all of `src/core/**/*.pl`.
+Implemented and verified. What landed differs from the original sketch in three
+places; each is noted below.
 
-### 4a. A layer that can be either materialized or disk-less
-Make `WrappedLayer` hold an enum instead of a bare `SyncStoreLayer`, in
+### 4a. `ReadLayer` — a layer that is either materialized or disk-less
+
 `terminusdb-store-prolog/src/layer.rs`:
 
 ```rust
@@ -169,45 +169,94 @@ pub enum ReadLayer {
     Materialized(SyncStoreLayer),
     Lazy(SyncLazyLayer),
 }
-// wrapped_clone_blob!("layer", pub WrappedLayer, ReadLayer)
+wrapped_clone_blob!("layer", pub WrappedLayer, ReadLayer);
 ```
 
-Keep `SyncStoreLayer`'s `open_write`/delta/rollup methods working by having the
-write/admin predicates require `ReadLayer::Materialized` (writes stay on the
-materialized path; only reads go disk-less).
+Rather than matching on the enum at ~30 predicate call sites, `ReadLayer` carries
+the whole read surface as inherent methods that dispatch internally, so the
+predicates keep reading as `layer.subject_id(..)`.
 
-### 4b. Route the read predicates (all in layer.rs)
-For each read predicate, match on `ReadLayer` and, for the `Lazy` arm, call the
-`SyncLazyLayer` method and convert `io::Result` → a Prolog error, using this
-crate's existing error path (the `context_error!`/`PrologError` machinery already
-used elsewhere in store-prolog). Sites, by line:
+**Every method returns `io::Result`, including on the materialized arm.** That
+uniformity is the point: it forces each predicate through `try_or_die`, so a
+failed disk-less read becomes a Prolog *exception*. Reporting a network failure
+as "no solution" would let a query return a wrong answer, which is the outcome
+an audit store can least afford. This resolves the error-semantics risk in §8.
 
-| Predicate | line | materialized call | disk-less call |
-|---|---|---|---|
-| `id_triple` | 211 (dispatch 220–263) | `triple_exists`/`triples_*` | same on `SyncLazyLayer`, `?`-propagated |
-| `subject_to_id` | 31 | `subject_id` | `subject_id(..)?` |
-| `id_to_subject` | ~40 | `id_subject` | `id_subject(..)?` |
-| `predicate_to_id` | 51 | `predicate_id` | `predicate_id(..)?` |
-| `id_to_predicate` | ~60 | `id_predicate` | `id_predicate(..)?` |
-| `object_to_id` | 75/79 | `object_node_id`/`object_value_id` | same `?` |
-| `id_to_object` | 97 | `id_object` | `id_object(..)?` |
-| `sp_card` | 289 | `triples_sp` | `triples_sp(..)?` |
-| `op_card` | 298 | `triples_o` | `triples_o(..)?` |
-| `id_triple_addition` / `_removal` | 304 / 378 | `triple_additions_*`/`_removals_*` | same on `SyncLazyLayer` (now available — see §6) |
+Writes and history rewriting (`open_write`, squash, rollup) are materialized-only
+and rejected explicitly on the disk-less arm, as are the chain-cumulative triple
+counts and `stored_size` — a disk-less handle would have to load every ancestor's
+adjacency to compute them, which defeats the purpose, so they error rather than
+being quietly slow.
 
-The `triples_*` methods return `Vec<IdTriple>` on `SyncLazyLayer` (vs a lazy
-iterator on `SyncStoreLayer`); wrap in `.into_iter()` and `Peekable<Box<dyn …>>`
-to keep `id_triple`'s return type unchanged.
+### 4b. Routed predicates
 
-### 4c. An opt-in disk-less store
-Add a store-open variant in `terminusdb-store-prolog/src/store.rs` (near :80-123),
-e.g. `open_diskless_object_store` / a flag on `open_archive_store`, that builds a
-`SyncStore` over the object backend and marks it so `store_id_layer/3` (layer.rs:198)
-yields `ReadLayer::Lazy(store.lazy_layer(name))` instead of
-`ReadLayer::Materialized(get_layer_from_id(name))`. Default path unchanged.
+All of `id_triple`, `id_triple_addition`, `id_triple_removal`, `subject_to_id`,
+`id_to_subject`, `predicate_to_id`, `id_to_predicate`, `object_to_id`,
+`id_to_object`, `sp_card`, `op_card`, `node_and_value_count`, `predicate_count`,
+`parent`, `retrieve_layer_stack_names` and `layer_equals` dispatch to whichever
+arm the layer carries.
 
-This is the entire Phase-1 surface: **`store-prolog/src/{store.rs, layer.rs}` only.**
-No change to `terminusdb-community`, none to `src/core/**/*.pl`.
+**Not routed:** `id_triple_value_range`, `id_triple_value_range_rev`, and
+`id_triple_sp_value_next/previous` — upstream range predicates that arrived after
+this plan was written. The first two are built on the materialized object index
+and have no block-lazy equivalent yet, so they raise on a disk-less layer rather
+than answer incompletely. (`sp_value_next/previous` do work disk-lessly: they are
+implemented as an `sp` scan.)
+
+### 4c. Opting in
+
+Three predicates in `terminusdb-store-prolog/src/store.rs`:
+
+| Predicate | Effect |
+|---|---|
+| `open_object_store(+Bucket, +Prefix, +CacheSize, -Store)` | Object-backed, layers materialized |
+| `open_diskless_object_store(+Bucket, +Prefix, +CacheSize, -Store)` | Object-backed, layers read block-lazily |
+| `store_diskless(+Store, -DisklessStore)` / `store_materialized(+Store, -Store)` | A *view* of an already-open store |
+
+`Bucket` is the atom `memory` (in-process, for tests) or an S3 bucket name, in
+which case credentials, region and any endpoint override come from the standard
+AWS environment variables — no secret passes through a Prolog term.
+
+The view predicates were not in the original sketch and turn out to be the useful
+shape: a process usually wants both handles — writes on the materialized one,
+queries on the disk-less one — and opening the bucket twice would give two
+independent caches (and, for an in-process bucket, two unrelated stores).
+
+**`WrappedStore` and `WrappedNamedGraph` now wrap `ReadStore`/`ReadNamedGraph`**,
+thin structs carrying the flag and `Deref`-ing to the underlying handle so every
+existing call site is untouched. The named graph has to carry it too, because
+`head/2` — not `store_id_layer/3` — is how Prolog usually obtains a layer; a
+disk-less store whose `head` returned materialized layers would never actually
+read disk-lessly.
+
+### 4d. `terminusdb-community` — two call sites, contrary to the original plan
+
+The plan claimed Phase 1 touched `store-prolog` only. It does not:
+`terminusdb-community/src/types.rs` reads `WrappedLayer.0` as a concrete
+`SyncStoreLayer`, so changing the blob's payload breaks it.
+
+`transaction_instance_layer` / `transaction_schema_layer` now raise
+`diskless_layer_unsupported_by_rust_readers` when handed a disk-less layer.
+Returning `None` would have been a quieter change and a much worse one — a
+GraphQL query on a disk-less store would answer as though the database were
+empty. Making the Rust readers disk-less aware is Phase 2.
+
+### Verification
+
+- Rust differential tests (`layer.rs`): both arms agree across the entire routed
+  read surface over a base+child chain, with non-vacuity assertions; unsupported
+  operations are rejected with `ErrorKind::Unsupported`.
+- Prolog differential test (`tests/manual/diskless_storage.pl`): one graph built
+  on an object store, then queried through both a materialized and a disk-less
+  layer — 20 probed values agree — and `open_write` on the disk-less layer raises.
+  The layer is sized so its dictionaries are genuinely block-addressed.
+
+```
+MATCH: disk-less and materialized agree on all 20 probed values
+  nv=1480 chain-depth=2 triples=720 additions=40 removals=20
+open_write on a disk-less layer raised:
+  error(rust_io_error(Unsupported,open_write requires a materialized layer; ...))
+```
 
 ---
 
@@ -268,10 +317,11 @@ three tiers below are runnable.
 
 ## 8. Risks / open decisions
 
-- **Error semantics.** A disk-less read can fail (network). Phase 1 converts
-  `io::Result::Err` to a Prolog error at the FFI boundary — good, but the WOQL
-  engine must treat a read error as an error, not as "no solution." Verify `id_triple`'s
-  nondet contract propagates the exception rather than failing silently.
+- **Error semantics — RESOLVED.** Every `ReadLayer` method returns `io::Result`
+  and every predicate routes it through `try_or_die`, so a failed disk-less read
+  raises rather than failing. `id_triple` resolves its iterator during `setup`,
+  where an error propagates as an exception; once setup succeeds the iterator is
+  materialized, so `call` cannot fail mid-solution.
 - **Query planner.** WOQL/GraphQL planning may assume O(1) resident access and
   favour "materialize then filter." On a disk-less layer that is the worst pattern;
   prefer the index-driven predicates (`triples_s/sp/o`). Phase 1 keeps existing

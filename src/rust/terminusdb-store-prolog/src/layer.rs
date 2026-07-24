@@ -9,56 +9,441 @@ use terminus_store::storage::{name_to_string, string_to_name};
 use terminus_store::store::sync::*;
 use terminus_store::Layer;
 
+type TripleIter = Box<dyn Iterator<Item = IdTriple> + Send>;
+
+/// A layer as the Prolog boundary sees it: either fully materialized in RAM, or
+/// read disk-lessly at block granularity straight from the object store.
+///
+/// Every read is fallible here, even on the materialized arm, because the
+/// disk-less arm talks to the network. That uniformity is deliberate: it forces
+/// each predicate through `try_or_die`, so a failed read surfaces as a Prolog
+/// *exception* rather than as "no solution". Silently reporting a network
+/// failure as an empty result would let a query return a wrong answer, which on
+/// an audit store is the one outcome worth paying anything to avoid.
+///
+/// Writes and history rewriting (`open_write`, squash, rollup) stay on the
+/// materialized arm only; the disk-less arm rejects them explicitly.
+#[derive(Clone)]
+pub enum ReadLayer {
+    Materialized(SyncStoreLayer),
+    Lazy(SyncLazyLayer),
+}
+
+/// Signal an operation the disk-less arm does not implement. Reported as an
+/// error, never as failure, so it can never be mistaken for "no results".
+fn unsupported<T>(what: &str) -> io::Result<T> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{what} requires a materialized layer; this layer is disk-less"),
+    ))
+}
+
+impl ReadLayer {
+    /// The materialized layer, if this is one. Used by the write/admin
+    /// predicates and by the Rust readers that are not yet disk-less aware.
+    pub fn materialized(&self) -> Option<&SyncStoreLayer> {
+        match self {
+            Self::Materialized(l) => Some(l),
+            Self::Lazy(_) => None,
+        }
+    }
+
+    pub fn into_materialized(self) -> Option<SyncStoreLayer> {
+        match self {
+            Self::Materialized(l) => Some(l),
+            Self::Lazy(_) => None,
+        }
+    }
+
+    /// A layer usable where a real, built layer is required: installing a graph
+    /// head, or applying a delta/diff into a builder. Those inputs are always
+    /// layers this process just built, so they are always materialized.
+    pub fn require_materialized_head(&self) -> io::Result<&SyncStoreLayer> {
+        self.require_materialized("this operation")
+    }
+
+    fn require_materialized(&self, what: &str) -> io::Result<&SyncStoreLayer> {
+        match self {
+            Self::Materialized(l) => Ok(l),
+            Self::Lazy(_) => unsupported(what),
+        }
+    }
+
+    pub fn name(&self) -> [u32; 5] {
+        match self {
+            Self::Materialized(l) => l.name(),
+            Self::Lazy(l) => l.name(),
+        }
+    }
+
+    // ---- chain metadata ----
+
+    pub fn node_and_value_count(&self) -> io::Result<u64> {
+        match self {
+            Self::Materialized(l) => Ok(l.node_and_value_count() as u64),
+            Self::Lazy(l) => l.node_and_value_count(),
+        }
+    }
+
+    pub fn predicate_count(&self) -> io::Result<u64> {
+        match self {
+            Self::Materialized(l) => Ok(l.predicate_count() as u64),
+            Self::Lazy(l) => l.predicate_count(),
+        }
+    }
+
+    pub fn parent(&self) -> io::Result<Option<ReadLayer>> {
+        match self {
+            Self::Materialized(l) => Ok(l.parent()?.map(ReadLayer::Materialized)),
+            Self::Lazy(l) => Ok(l.parent()?.map(ReadLayer::Lazy)),
+        }
+    }
+
+    pub fn retrieve_layer_stack_names(&self) -> io::Result<Vec<[u32; 5]>> {
+        match self {
+            Self::Materialized(l) => l.retrieve_layer_stack_names(),
+            Self::Lazy(l) => l.retrieve_layer_stack_names(),
+        }
+    }
+
+    // ---- forward resolution (string -> id) ----
+
+    pub fn subject_id(&self, subject: &str) -> io::Result<Option<u64>> {
+        match self {
+            Self::Materialized(l) => Ok(l.subject_id(subject)),
+            Self::Lazy(l) => l.subject_id(subject),
+        }
+    }
+
+    pub fn predicate_id(&self, predicate: &str) -> io::Result<Option<u64>> {
+        match self {
+            Self::Materialized(l) => Ok(l.predicate_id(predicate)),
+            Self::Lazy(l) => l.predicate_id(predicate),
+        }
+    }
+
+    pub fn object_node_id(&self, object: &str) -> io::Result<Option<u64>> {
+        match self {
+            Self::Materialized(l) => Ok(l.object_node_id(object)),
+            Self::Lazy(l) => l.object_node_id(object),
+        }
+    }
+
+    pub fn object_value_id(&self, object: &TypedDictEntry) -> io::Result<Option<u64>> {
+        match self {
+            Self::Materialized(l) => Ok(l.object_value_id(object)),
+            Self::Lazy(l) => l.object_value_id(object),
+        }
+    }
+
+    // ---- reverse resolution (id -> string/value) ----
+
+    pub fn id_subject(&self, id: u64) -> io::Result<Option<String>> {
+        match self {
+            Self::Materialized(l) => Ok(l.id_subject(id)),
+            Self::Lazy(l) => l.id_subject(id),
+        }
+    }
+
+    pub fn id_predicate(&self, id: u64) -> io::Result<Option<String>> {
+        match self {
+            Self::Materialized(l) => Ok(l.id_predicate(id)),
+            Self::Lazy(l) => l.id_predicate(id),
+        }
+    }
+
+    pub fn id_object(&self, id: u64) -> io::Result<Option<ObjectType>> {
+        match self {
+            Self::Materialized(l) => Ok(l.id_object(id)),
+            Self::Lazy(l) => l.id_object(id),
+        }
+    }
+
+    // ---- existence and traversal ----
+
+    pub fn triple_exists(&self, subject: u64, predicate: u64, object: u64) -> io::Result<bool> {
+        match self {
+            Self::Materialized(l) => Ok(l.triple_exists(subject, predicate, object)),
+            Self::Lazy(l) => l.triple_exists(subject, predicate, object),
+        }
+    }
+
+    pub fn triples(&self) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => Ok(l.triples()),
+            Self::Lazy(l) => l.triples(),
+        }
+    }
+
+    pub fn triples_s(&self, subject: u64) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => Ok(l.triples_s(subject)),
+            Self::Lazy(l) => Ok(Box::new(l.triples_s(subject)?.into_iter())),
+        }
+    }
+
+    pub fn triples_sp(&self, subject: u64, predicate: u64) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => Ok(l.triples_sp(subject, predicate)),
+            Self::Lazy(l) => Ok(Box::new(l.triples_sp(subject, predicate)?.into_iter())),
+        }
+    }
+
+    pub fn triples_p(&self, predicate: u64) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => Ok(l.triples_p(predicate)),
+            Self::Lazy(l) => Ok(Box::new(l.triples_p(predicate)?.into_iter())),
+        }
+    }
+
+    pub fn triples_o(&self, object: u64) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => Ok(l.triples_o(object)),
+            Self::Lazy(l) => Ok(Box::new(l.triples_o(object)?.into_iter())),
+        }
+    }
+
+    // ---- deltas ----
+
+    pub fn triple_addition_exists(&self, s: u64, p: u64, o: u64) -> io::Result<bool> {
+        match self {
+            Self::Materialized(l) => l.triple_addition_exists(s, p, o),
+            Self::Lazy(l) => l.triple_addition_exists(s, p, o),
+        }
+    }
+
+    pub fn triple_removal_exists(&self, s: u64, p: u64, o: u64) -> io::Result<bool> {
+        match self {
+            Self::Materialized(l) => l.triple_removal_exists(s, p, o),
+            Self::Lazy(l) => l.triple_removal_exists(s, p, o),
+        }
+    }
+
+    pub fn triple_additions(&self) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => l.triple_additions(),
+            Self::Lazy(l) => l.triple_additions(),
+        }
+    }
+
+    pub fn triple_removals(&self) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => l.triple_removals(),
+            Self::Lazy(l) => l.triple_removals(),
+        }
+    }
+
+    pub fn triple_additions_s(&self, subject: u64) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => l.triple_additions_s(subject),
+            Self::Lazy(l) => l.triple_additions_s(subject),
+        }
+    }
+
+    pub fn triple_removals_s(&self, subject: u64) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => l.triple_removals_s(subject),
+            Self::Lazy(l) => l.triple_removals_s(subject),
+        }
+    }
+
+    pub fn triple_additions_sp(&self, subject: u64, predicate: u64) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => l.triple_additions_sp(subject, predicate),
+            Self::Lazy(l) => l.triple_additions_sp(subject, predicate),
+        }
+    }
+
+    pub fn triple_removals_sp(&self, subject: u64, predicate: u64) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => l.triple_removals_sp(subject, predicate),
+            Self::Lazy(l) => l.triple_removals_sp(subject, predicate),
+        }
+    }
+
+    pub fn triple_additions_p(&self, predicate: u64) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => l.triple_additions_p(predicate),
+            Self::Lazy(l) => l.triple_additions_p(predicate),
+        }
+    }
+
+    pub fn triple_removals_p(&self, predicate: u64) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => l.triple_removals_p(predicate),
+            Self::Lazy(l) => l.triple_removals_p(predicate),
+        }
+    }
+
+    pub fn triple_additions_o(&self, object: u64) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => l.triple_additions_o(object),
+            Self::Lazy(l) => l.triple_additions_o(object),
+        }
+    }
+
+    pub fn triple_removals_o(&self, object: u64) -> io::Result<TripleIter> {
+        match self {
+            Self::Materialized(l) => l.triple_removals_o(object),
+            Self::Lazy(l) => l.triple_removals_o(object),
+        }
+    }
+
+    // ---- counts ----
+    //
+    // These are chain-cumulative triple counts. The disk-less handle would have
+    // to load every ancestor's adjacency to compute them, which defeats the
+    // point, so they stay materialized-only rather than being quietly slow.
+
+    pub fn triple_layer_addition_count(&self) -> io::Result<usize> {
+        self.require_materialized("layer_addition_count")?
+            .triple_layer_addition_count()
+    }
+
+    pub fn triple_layer_removal_count(&self) -> io::Result<usize> {
+        self.require_materialized("layer_removal_count")?
+            .triple_layer_removal_count()
+    }
+
+    pub fn triple_addition_count(&self) -> io::Result<usize> {
+        Ok(self
+            .require_materialized("layer_total_addition_count")?
+            .triple_addition_count())
+    }
+
+    pub fn triple_removal_count(&self) -> io::Result<usize> {
+        Ok(self
+            .require_materialized("layer_total_removal_count")?
+            .triple_removal_count())
+    }
+
+    pub fn triple_count(&self) -> io::Result<usize> {
+        Ok(self
+            .require_materialized("layer_total_triple_count")?
+            .triple_count())
+    }
+
+    pub fn stored_size(&self) -> io::Result<usize> {
+        Ok(self
+            .require_materialized("layer_stored_size")?
+            .stored_size())
+    }
+
+    // ---- value ranges ----
+    //
+    // Upstream's range iterators are built on the materialized object index;
+    // there is no block-lazy equivalent yet, so disk-less range queries are
+    // rejected rather than answered incompletely.
+
+    pub fn triples_value_range(
+        &self,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> io::Result<TripleIter> {
+        Ok(self
+            .require_materialized("id_triple_value_range")?
+            .triples_value_range(low, high))
+    }
+
+    pub fn triples_value_range_rev(
+        &self,
+        low: &TypedDictEntry,
+        high: &TypedDictEntry,
+    ) -> io::Result<TripleIter> {
+        Ok(self
+            .require_materialized("id_triple_value_range_rev")?
+            .triples_value_range_rev(low, high))
+    }
+
+    // ---- writes and history rewriting (materialized only) ----
+
+    pub fn open_write(&self) -> io::Result<SyncStoreLayerBuilder> {
+        self.require_materialized("open_write")?.open_write()
+    }
+
+    pub fn squash(&self) -> io::Result<SyncStoreLayer> {
+        self.require_materialized("squash")?.squash()
+    }
+
+    pub fn squash_upto(&self, upto: &ReadLayer) -> io::Result<SyncStoreLayer> {
+        let upto = upto.require_materialized("squash_upto")?;
+        self.require_materialized("squash_upto")?.squash_upto(upto)
+    }
+
+    pub fn rollup(&self) -> io::Result<()> {
+        self.require_materialized("rollup")?.rollup()
+    }
+
+    pub fn rollup_upto(&self, upto: &ReadLayer) -> io::Result<()> {
+        let upto = upto.require_materialized("rollup_upto")?;
+        self.require_materialized("rollup_upto")?.rollup_upto(upto)
+    }
+
+    pub fn imprecise_rollup_upto(&self, upto: &ReadLayer) -> io::Result<()> {
+        let upto = upto.require_materialized("imprecise_rollup_upto")?;
+        self.require_materialized("imprecise_rollup_upto")?
+            .imprecise_rollup_upto(upto)
+    }
+}
+
+impl PartialEq for ReadLayer {
+    /// Layers are content-addressed, so identity is the name. A disk-less and a
+    /// materialized handle on the same layer are the same layer.
+    fn eq(&self, other: &Self) -> bool {
+        self.name() == other.name()
+    }
+}
+
 predicates! {
-    pub semidet fn node_and_value_count(_context, layer_term, count_term) {
+    pub semidet fn node_and_value_count(context, layer_term, count_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
-        let count = layer.node_and_value_count() as u64;
+        let count = context.try_or_die(layer.node_and_value_count())?;
 
         count_term.unify(count)
     }
 
-    pub semidet fn predicate_count(_context, layer_term, count_term) {
+    pub semidet fn predicate_count(context, layer_term, count_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
-        let count = layer.predicate_count() as u64;
+        let count = context.try_or_die(layer.predicate_count())?;
 
         count_term.unify(count)
     }
 
-    pub semidet fn subject_to_id(_context, layer_term, subject_term, id_term) {
+    pub semidet fn subject_to_id(context, layer_term, subject_term, id_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
         let subject: PrologText = subject_term.get_ex()?;
 
-        match layer.subject_id(&subject) {
+        match context.try_or_die(layer.subject_id(&subject))? {
             Some(id) => id_term.unify(id),
             None => Err(PrologError::Failure)
         }
     }
 
-    pub semidet fn id_to_subject(_context, layer_term, id_term, subject_term) {
+    pub semidet fn id_to_subject(context, layer_term, id_term, subject_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
         let id: u64 = id_term.get_ex()?;
 
-        match layer.id_subject(id) {
+        match context.try_or_die(layer.id_subject(id))? {
             Some(subject) => subject_term.unify(subject),
             None => Err(PrologError::Failure)
         }
     }
 
-    pub semidet fn predicate_to_id(_context, layer_term, predicate_term, id_term) {
+    pub semidet fn predicate_to_id(context, layer_term, predicate_term, id_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
         let predicate: PrologText = predicate_term.get_ex()?;
 
-        match layer.predicate_id(&predicate) {
+        match context.try_or_die(layer.predicate_id(&predicate))? {
             Some(id) => id_term.unify(id),
             None => Err(PrologError::Failure)
         }
     }
 
-    pub semidet fn id_to_predicate(_context, layer_term, id_term, predicate_term) {
+    pub semidet fn id_to_predicate(context, layer_term, id_term, predicate_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
         let id: u64 = id_term.get_ex()?;
 
-        match layer.id_predicate(id) {
+        match context.try_or_die(layer.id_predicate(id))? {
             Some(predicate) => predicate_term.unify(predicate),
             None => Err(PrologError::Failure)
         }
@@ -72,15 +457,15 @@ predicates! {
         let id: Option<u64>;
         if attempt(object_term.unify(term!{context: node(#&inner)}?))? {
             let object: PrologText = inner.get_ex()?;
-            id = layer.object_node_id(&object);
+            id = context.try_or_die(layer.object_node_id(&object))?;
         }
         else if attempt(object_term.unify(term!{context: value(#&inner,#&ty)}?))? {
             let entry = make_entry_from_term(context,&inner,&ty)?;
-            id = layer.object_value_id(&entry);
+            id = context.try_or_die(layer.object_value_id(&entry))?;
         }
         else if attempt(object_term.unify(term!{context: lang(#&inner,#&ty)}?))? {
             let entry = make_entry_from_lang_term(context,&inner,&ty)?;
-            id = layer.object_value_id(&entry);
+            id = context.try_or_die(layer.object_value_id(&entry))?;
         }
         else {
             return context.raise_exception(&term!{context: error(domain_error(oneof([node(), value()]), #object_term), _)}?);
@@ -97,7 +482,7 @@ predicates! {
         let layer: WrappedLayer = layer_term.get_ex()?;
         let id: u64 = id_term.get_ex()?;
 
-        match layer.id_object(id) {
+        match context.try_or_die(layer.id_object(id))? {
             Some(ObjectType::Node(object)) => {
                 object_term.unify(functor!("node/1"))?;
                 object_term.unify_arg(1, object)
@@ -120,14 +505,14 @@ predicates! {
     pub semidet fn squash(context, layer_term, squashed_layer_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
         let squashed = context.try_or_die(layer.squash())?;
-        squashed_layer_term.unify(&WrappedLayer(squashed))
+        squashed_layer_term.unify(&WrappedLayer(ReadLayer::Materialized(squashed)))
     }
 
     pub semidet fn squash_upto(context, layer_term, upto_term, squashed_layer_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
         let upto: WrappedLayer = upto_term.get_ex()?;
         let squashed = context.try_or_die(layer.squash_upto(&upto))?;
-        squashed_layer_term.unify(&WrappedLayer(squashed))
+        squashed_layer_term.unify(&WrappedLayer(ReadLayer::Materialized(squashed)))
     }
 
     pub semidet fn rollup(context, layer_term) {
@@ -161,23 +546,23 @@ predicates! {
         count_term.unify(count)
     }
 
-    pub semidet fn layer_total_addition_count(_context, layer_term, count_term) {
+    pub semidet fn layer_total_addition_count(context, layer_term, count_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
-        let count = layer.triple_addition_count() as u64;
+        let count = context.try_or_die(layer.triple_addition_count())? as u64;
 
         count_term.unify(count)
     }
 
-    pub semidet fn layer_total_removal_count(_context, layer_term, count_term) {
+    pub semidet fn layer_total_removal_count(context, layer_term, count_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
-        let count = layer.triple_removal_count() as u64;
+        let count = context.try_or_die(layer.triple_removal_count())? as u64;
 
         count_term.unify(count)
     }
 
-    pub semidet fn layer_total_triple_count(_context, layer_term, count_term) {
+    pub semidet fn layer_total_triple_count(context, layer_term, count_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
-        let count = layer.triple_count() as u64;
+        let count = context.try_or_die(layer.triple_count())? as u64;
 
         count_term.unify(count)
     }
@@ -195,9 +580,22 @@ predicates! {
             let id: PrologText = id_term.get_ex()?;
             let name = context.try_or_die(string_to_name(&id))?;
 
-            match context.try_or_die(store.get_layer_from_id(name))? {
-                Some(layer) => layer_term.unify(&WrappedLayer(layer)),
-                None => Err(PrologError::Failure)
+            if store.diskless {
+                // A disk-less handle is valid for any layer the store knows
+                // about, so existence still has to be checked explicitly --
+                // otherwise an unknown id would silently yield a handle that
+                // errors on first use instead of failing here.
+                if !context.try_or_die(store.layer_exists(name))? {
+                    return Err(PrologError::Failure);
+                }
+                let layer = store.lazy_layer(name);
+                layer_term.unify(&WrappedLayer(ReadLayer::Lazy(layer)))
+            }
+            else {
+                match context.try_or_die(store.get_layer_from_id(name))? {
+                    Some(layer) => layer_term.unify(&WrappedLayer(ReadLayer::Materialized(layer))),
+                    None => Err(PrologError::Failure)
+                }
             }
         }
         else {
@@ -217,7 +615,7 @@ predicates! {
                 if let Some(predicate_id) = attempt_opt(predicate_id_term.get::<u64>())? {
                     if let Some(object_id) = attempt_opt(object_id_term.get::<u64>())? {
                         // everything is known
-                        if layer.triple_exists(subject_id, predicate_id, object_id) {
+                        if context.try_or_die(layer.triple_exists(subject_id, predicate_id, object_id))? {
                             return Ok(None);
                         }
                         else {
@@ -226,19 +624,19 @@ predicates! {
                     }
                     else {
                         // subject and predicate are known, object is not
-                        iter = layer.triples_sp(subject_id, predicate_id);
+                        iter = context.try_or_die(layer.triples_sp(subject_id, predicate_id))?;
                     }
                 }
                 else {
                     // subject is known, predicate is not. object may or may not be bound already.
                     if let Some(object_id) = attempt_opt(object_id_term.get::<u64>())? {
                         // object is known so predicate is the only unknown
-                        iter = Box::new(layer.triples_s(subject_id)
+                        iter = Box::new(context.try_or_die(layer.triples_s(subject_id))?
                                         .filter(move |t| t.object == object_id));
                     }
                     else {
                         // both predicate and object are unknown
-                        iter = layer.triples_s(subject_id);
+                        iter = context.try_or_die(layer.triples_s(subject_id))?;
                     }
                 }
             }
@@ -246,21 +644,21 @@ predicates! {
                 // subject is unknown
                 if let Some(predicate_id) = attempt_opt(predicate_id_term.get::<u64>())? {
                     // predicate is known
-                    iter = Box::new(layer.triples_o(object_id)
+                    iter = Box::new(context.try_or_die(layer.triples_o(object_id))?
                                     .filter(move |t| t.predicate == predicate_id));
                 }
                 else {
                     // predicate is unknown, only object is known
-                    iter = layer.triples_o(object_id)
+                    iter = context.try_or_die(layer.triples_o(object_id))?
                 }
             }
             else if let Some(predicate_id) = attempt_opt(predicate_id_term.get::<u64>())? {
                 // only predicate is known
-                iter = layer.triples_p(predicate_id);
+                iter = context.try_or_die(layer.triples_p(predicate_id))?;
             }
             else {
                 // nothing is known so return everything
-                iter = layer.triples();
+                iter = context.try_or_die(layer.triples())?;
             }
 
             // lets make it peekable
@@ -282,20 +680,20 @@ predicates! {
         }
     }
 
-    pub semidet fn sp_card(_context, layer_term, subject_id_term, predicate_id_term, count_term) {
+    pub semidet fn sp_card(context, layer_term, subject_id_term, predicate_id_term, count_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
         let subject_id: u64 = subject_id_term.get_ex()?;
         let predicate_id: u64 = predicate_id_term.get_ex()?;
-        let iter = layer.triples_sp(subject_id, predicate_id);
+        let iter = context.try_or_die(layer.triples_sp(subject_id, predicate_id))?;
         let count = iter.count() as u64;
         count_term.unify(count)
     }
 
-    pub semidet fn op_card(_context, layer_term, object_id_term, predicate_id_term, count_term) {
+    pub semidet fn op_card(context, layer_term, object_id_term, predicate_id_term, count_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
         let object_id: u64 = object_id_term.get_ex()?;
         let predicate_id: u64 = predicate_id_term.get_ex()?;
-        let count = layer.triples_o(object_id)
+        let count = context.try_or_die(layer.triples_o(object_id))?
             .filter(|t| t.predicate == predicate_id)
             .count() as u64;
         count_term.unify(count)
@@ -475,7 +873,7 @@ predicates! {
                 return context.raise_exception(&term!{context: error(domain_error(oneof([value(), lang()]), #high_term), _)}?);
             }
 
-            let iter = layer.triples_value_range(&low_entry, &high_entry).peekable();
+            let iter = context.try_or_die(layer.triples_value_range(&low_entry, &high_entry))?.peekable();
 
             Ok(Some(iter))
         },
@@ -519,7 +917,7 @@ predicates! {
                 return context.raise_exception(&term!{context: error(domain_error(oneof([value(), lang()]), #high_term), _)}?);
             }
 
-            let iter = layer.triples_value_range_rev(&low_entry, &high_entry).peekable();
+            let iter = context.try_or_die(layer.triples_value_range_rev(&low_entry, &high_entry))?.peekable();
 
             Ok(Some(iter))
         },
@@ -556,8 +954,8 @@ predicates! {
         let ref_dt = reference.datatype();
         let mut best: Option<(u64, TypedDictEntry)> = None;
 
-        for triple in layer.triples_sp(subject, predicate) {
-            if let Some(ObjectType::Value(entry)) = layer.id_object(triple.object) {
+        for triple in context.try_or_die(layer.triples_sp(subject, predicate))? {
+            if let Some(ObjectType::Value(entry)) = context.try_or_die(layer.id_object(triple.object))? {
                 if entry.datatype() == ref_dt && entry > reference {
                     if let Some((_, ref best_entry)) = best {
                         if entry < *best_entry {
@@ -595,8 +993,8 @@ predicates! {
         let ref_dt = reference.datatype();
         let mut best: Option<(u64, TypedDictEntry)> = None;
 
-        for triple in layer.triples_sp(subject, predicate) {
-            if let Some(ObjectType::Value(entry)) = layer.id_object(triple.object) {
+        for triple in context.try_or_die(layer.triples_sp(subject, predicate))? {
+            if let Some(ObjectType::Value(entry)) = context.try_or_die(layer.id_object(triple.object))? {
                 if entry.datatype() == ref_dt && entry < reference {
                     if let Some((_, ref best_entry)) = best {
                         if entry > *best_entry {
@@ -626,9 +1024,9 @@ predicates! {
         layer_stack_term.unify(name_strings.as_slice())
     }
 
-    pub semidet fn layer_stored_size(_context, layer_term, size_term) {
+    pub semidet fn layer_stored_size(context, layer_term, size_term) {
         let layer: WrappedLayer = layer_term.get_ex()?;
-        let size = layer.stored_size();
+        let size = context.try_or_die(layer.stored_size())?;
         size_term.unify(size as u64)
     }
 
@@ -640,10 +1038,307 @@ predicates! {
     }
 }
 
-wrapped_clone_blob!("layer", pub WrappedLayer, SyncStoreLayer);
+wrapped_clone_blob!("layer", pub WrappedLayer, ReadLayer);
 
 impl CloneBlobImpl for WrappedLayer {
     fn write(&self, stream: &mut PrologStream) -> io::Result<()> {
         write!(stream, "<layer {}>", name_to_string(self.name()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use terminus_store::object_store::{memory::InMemory, ObjectStore};
+    use terminus_store::store::sync::SyncStore;
+    use terminus_store::ValueTriple;
+
+    /// A base+child graph in an in-process bucket, plus the head's name.
+    fn graph() -> (SyncStore, [u32; 5]) {
+        let bucket: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(InMemory::new());
+        let store = SyncStore::wrap(terminus_store::open_object_store(bucket, "", 1 << 30));
+        let db = store.create("g").unwrap();
+
+        // Enough entries that the dictionaries are genuinely block-addressed,
+        // so the disk-less arm exercises block-lazy reads rather than the
+        // small-dictionary whole-load fallback.
+        let builder = store.create_base_layer().unwrap();
+        for i in 0..700 {
+            builder
+                .add_value_triple(ValueTriple::new_string_value(
+                    &format!("s{:04}", i),
+                    "p",
+                    &format!("o{:04}", i),
+                ))
+                .unwrap();
+            builder
+                .add_value_triple(ValueTriple::new_node(
+                    &format!("s{:04}", i),
+                    "rel",
+                    &format!("s{:04}", (i + 1) % 700),
+                ))
+                .unwrap();
+        }
+        let mut layer = builder.commit().unwrap();
+        db.set_head(&layer).unwrap();
+
+        // a child, so the head has a real delta to query
+        let builder = layer.open_write().unwrap();
+        for i in 700..740 {
+            builder
+                .add_value_triple(ValueTriple::new_string_value(
+                    &format!("s{:04}", i),
+                    "p",
+                    &format!("o{:04}", i),
+                ))
+                .unwrap();
+        }
+        for i in 0..20 {
+            builder
+                .remove_value_triple(ValueTriple::new_string_value(
+                    &format!("s{:04}", i),
+                    "p",
+                    &format!("o{:04}", i),
+                ))
+                .unwrap();
+        }
+        layer = builder.commit().unwrap();
+        db.set_head(&layer).unwrap();
+
+        let head = layer.name();
+        (store, head)
+    }
+
+    fn arms() -> (ReadLayer, ReadLayer) {
+        let (store, head) = graph();
+        (
+            ReadLayer::Materialized(store.get_layer_from_id(head).unwrap().unwrap()),
+            ReadLayer::Lazy(store.lazy_layer(head)),
+        )
+    }
+
+    fn sorted(it: TripleIter) -> Vec<IdTriple> {
+        let mut v: Vec<IdTriple> = it.collect();
+        v.sort();
+        v
+    }
+
+    /// The whole read surface Phase 1 routes must answer identically on both
+    /// arms. Ids are comparable directly: both arms read the same layers, so
+    /// they share one id space.
+    #[test]
+    fn both_arms_agree_on_the_whole_read_surface() {
+        let (m, l) = arms();
+
+        assert_eq!(m.name(), l.name());
+        assert!(m == l, "same layer, so equal regardless of arm");
+
+        // chain metadata
+        assert_eq!(
+            m.node_and_value_count().unwrap(),
+            l.node_and_value_count().unwrap()
+        );
+        assert_eq!(m.predicate_count().unwrap(), l.predicate_count().unwrap());
+        assert_eq!(
+            m.retrieve_layer_stack_names().unwrap(),
+            l.retrieve_layer_stack_names().unwrap()
+        );
+        assert_eq!(
+            m.parent().unwrap().map(|p| p.name()),
+            l.parent().unwrap().map(|p| p.name())
+        );
+        assert!(
+            m.parent().unwrap().is_some(),
+            "test graph must have a chain"
+        );
+
+        // forward resolution
+        let sid = m.subject_id("s0100").unwrap();
+        assert!(sid.is_some(), "resolution check must not be vacuous");
+        assert_eq!(sid, l.subject_id("s0100").unwrap());
+        assert_eq!(m.predicate_id("p").unwrap(), l.predicate_id("p").unwrap());
+        assert_eq!(
+            m.object_node_id("s0101").unwrap(),
+            l.object_node_id("s0101").unwrap()
+        );
+        assert_eq!(
+            m.subject_id("nonexistent").unwrap(),
+            l.subject_id("nonexistent").unwrap()
+        );
+        assert!(m.subject_id("nonexistent").unwrap().is_none());
+
+        let entry = <String as tdb_succinct::TdbDataType>::make_entry(&"o0100");
+        assert_eq!(
+            m.object_value_id(&entry).unwrap(),
+            l.object_value_id(&entry).unwrap()
+        );
+
+        // reverse resolution
+        let sid = sid.unwrap();
+        assert_eq!(m.id_subject(sid).unwrap(), l.id_subject(sid).unwrap());
+        assert_eq!(m.id_subject(sid).unwrap().as_deref(), Some("s0100"));
+        let pid = m.predicate_id("p").unwrap().unwrap();
+        assert_eq!(m.id_predicate(pid).unwrap(), l.id_predicate(pid).unwrap());
+        let oid = m.object_value_id(&entry).unwrap().unwrap();
+        assert_eq!(m.id_object(oid).unwrap(), l.id_object(oid).unwrap());
+
+        // existence, both ways
+        assert!(m.triple_exists(sid, pid, oid).unwrap());
+        assert_eq!(
+            m.triple_exists(sid, pid, oid).unwrap(),
+            l.triple_exists(sid, pid, oid).unwrap()
+        );
+        let absent = m
+            .object_value_id(&<String as tdb_succinct::TdbDataType>::make_entry(&"o0101"))
+            .unwrap()
+            .unwrap();
+        assert!(!m.triple_exists(sid, pid, absent).unwrap());
+        assert_eq!(
+            m.triple_exists(sid, pid, absent).unwrap(),
+            l.triple_exists(sid, pid, absent).unwrap()
+        );
+
+        // traversal
+        assert!(!sorted(m.triples_s(sid).unwrap()).is_empty());
+        assert_eq!(
+            sorted(m.triples_s(sid).unwrap()),
+            sorted(l.triples_s(sid).unwrap())
+        );
+        assert_eq!(
+            sorted(m.triples_sp(sid, pid).unwrap()),
+            sorted(l.triples_sp(sid, pid).unwrap())
+        );
+        assert_eq!(
+            sorted(m.triples_o(oid).unwrap()),
+            sorted(l.triples_o(oid).unwrap())
+        );
+        assert_eq!(
+            sorted(m.triples_p(pid).unwrap()),
+            sorted(l.triples_p(pid).unwrap())
+        );
+        assert_eq!(sorted(m.triples().unwrap()), sorted(l.triples().unwrap()));
+
+        // deltas -- the head is a child, so these are non-empty
+        let adds = sorted(m.triple_additions().unwrap());
+        let rems = sorted(m.triple_removals().unwrap());
+        assert!(!adds.is_empty() && !rems.is_empty());
+        assert_eq!(adds, sorted(l.triple_additions().unwrap()));
+        assert_eq!(rems, sorted(l.triple_removals().unwrap()));
+
+        let a = adds[0];
+        assert_eq!(
+            m.triple_addition_exists(a.subject, a.predicate, a.object)
+                .unwrap(),
+            l.triple_addition_exists(a.subject, a.predicate, a.object)
+                .unwrap()
+        );
+        let r = rems[0];
+        assert_eq!(
+            m.triple_removal_exists(r.subject, r.predicate, r.object)
+                .unwrap(),
+            l.triple_removal_exists(r.subject, r.predicate, r.object)
+                .unwrap()
+        );
+        assert_eq!(
+            sorted(m.triple_additions_s(a.subject).unwrap()),
+            sorted(l.triple_additions_s(a.subject).unwrap())
+        );
+        assert_eq!(
+            sorted(m.triple_additions_sp(a.subject, a.predicate).unwrap()),
+            sorted(l.triple_additions_sp(a.subject, a.predicate).unwrap())
+        );
+        assert_eq!(
+            sorted(m.triple_additions_p(a.predicate).unwrap()),
+            sorted(l.triple_additions_p(a.predicate).unwrap())
+        );
+        assert_eq!(
+            sorted(m.triple_additions_o(a.object).unwrap()),
+            sorted(l.triple_additions_o(a.object).unwrap())
+        );
+        assert_eq!(
+            sorted(m.triple_removals_s(r.subject).unwrap()),
+            sorted(l.triple_removals_s(r.subject).unwrap())
+        );
+        assert_eq!(
+            sorted(m.triple_removals_sp(r.subject, r.predicate).unwrap()),
+            sorted(l.triple_removals_sp(r.subject, r.predicate).unwrap())
+        );
+        assert_eq!(
+            sorted(m.triple_removals_p(r.predicate).unwrap()),
+            sorted(l.triple_removals_p(r.predicate).unwrap())
+        );
+        assert_eq!(
+            sorted(m.triple_removals_o(r.object).unwrap()),
+            sorted(l.triple_removals_o(r.object).unwrap())
+        );
+    }
+
+    /// Operations the disk-less arm does not implement must be reported as
+    /// errors. A silent `None`/empty here would read as "no such thing" and
+    /// could be mistaken for a legitimate answer.
+    #[test]
+    fn disk_less_arm_rejects_unsupported_operations_loudly() {
+        let (m, l) = arms();
+
+        // `expect_err` would need Debug on the Ok types (builders, iterators),
+        // which they do not implement, so match instead.
+        macro_rules! rejects {
+            ($e:expr, $what:literal) => {
+                match $e {
+                    Ok(_) => panic!("{} should be rejected on a disk-less layer", $what),
+                    Err(err) => {
+                        assert_eq!(err.kind(), io::ErrorKind::Unsupported, "{}", $what);
+                        assert!(
+                            err.to_string().contains("disk-less"),
+                            "{} error should say why: {err}",
+                            $what
+                        );
+                    }
+                }
+            };
+        }
+
+        rejects!(l.open_write(), "open_write");
+        rejects!(l.squash(), "squash");
+        rejects!(l.rollup(), "rollup");
+        rejects!(l.squash_upto(&m), "squash_upto");
+        rejects!(l.rollup_upto(&m), "rollup_upto");
+        rejects!(l.imprecise_rollup_upto(&m), "imprecise_rollup_upto");
+        rejects!(l.triple_count(), "triple_count");
+        rejects!(l.triple_addition_count(), "triple_addition_count");
+        rejects!(l.triple_removal_count(), "triple_removal_count");
+        rejects!(
+            l.triple_layer_addition_count(),
+            "triple_layer_addition_count"
+        );
+        rejects!(l.triple_layer_removal_count(), "triple_layer_removal_count");
+        rejects!(l.stored_size(), "stored_size");
+
+        let low = <String as tdb_succinct::TdbDataType>::make_entry(&"a");
+        let high = <String as tdb_succinct::TdbDataType>::make_entry(&"z");
+        rejects!(l.triples_value_range(&low, &high), "triples_value_range");
+        rejects!(
+            l.triples_value_range_rev(&low, &high),
+            "triples_value_range_rev"
+        );
+
+        // the materialized arm still answers all of these
+        assert!(m.triple_count().unwrap() > 0);
+        // stored_size has a trait default of 0 for layers that do not track it,
+        // so only assert that the materialized arm answers rather than errors.
+        assert!(m.stored_size().is_ok());
+        assert!(m.open_write().is_ok());
+        assert!(m.triples_value_range(&low, &high).is_ok());
+    }
+
+    /// `into_materialized` is what keeps the not-yet-disk-less Rust readers
+    /// honest: it must distinguish the arms rather than silently unwrapping.
+    #[test]
+    fn materialized_accessor_distinguishes_the_arms() {
+        let (m, l) = arms();
+        assert!(m.materialized().is_some());
+        assert!(l.materialized().is_none());
+        assert!(m.into_materialized().is_some());
+        assert!(l.into_materialized().is_none());
     }
 }

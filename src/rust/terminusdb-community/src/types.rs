@@ -7,6 +7,24 @@ use terminusdb_store_prolog::{
 
 use crate::swipl::atom;
 
+/// The Rust readers (GraphQL, documents, path queries) take a concrete
+/// `SyncStoreLayer` and are not disk-less aware yet -- that is Phase 2 of the
+/// disk-less integration. Until then, a disk-less layer reaching them is
+/// reported as an error rather than as "no layer": returning `None` here would
+/// make a GraphQL query on a disk-less store answer as if the database were
+/// empty, which is a wrong answer rather than a failure.
+fn require_materialized<C: QueryableContextType>(
+    context: &Context<C>,
+    layer: ReadLayer,
+) -> PrologResult<Option<SyncStoreLayer>> {
+    match layer.into_materialized() {
+        Some(l) => Ok(Some(l)),
+        None => context.raise_exception(
+            &term! {context: error(diskless_layer_unsupported_by_rust_readers, _)}?,
+        ),
+    }
+}
+
 pub fn transaction_instance_layer<C: QueryableContextType>(
     context: &Context<C>,
     transaction_term: &Term,
@@ -20,7 +38,10 @@ pub fn transaction_instance_layer<C: QueryableContextType>(
 
     if let Some(item) = frame.term_list_iter(&list_term).next() {
         let layer: Option<WrappedLayer> = attempt_opt(item.get_dict_key(&read_atom))?;
-        Ok(layer.map(|l| l.0))
+        match layer {
+            None => Ok(None),
+            Some(l) => require_materialized(context, l.0.clone()),
+        }
     } else {
         Ok(None)
     }
@@ -39,7 +60,10 @@ pub fn transaction_schema_layer<C: QueryableContextType>(
 
     if let Some(item) = frame.term_list_iter(&list_term).next() {
         let layer: Option<WrappedLayer> = attempt_opt(item.get_dict_key(&read_atom))?;
-        Ok(layer.map(|l| l.0))
+        match layer {
+            None => Ok(None),
+            Some(l) => require_materialized(context, l.0.clone()),
+        }
     } else {
         Ok(None)
     }

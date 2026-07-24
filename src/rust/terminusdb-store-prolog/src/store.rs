@@ -46,7 +46,12 @@ fn get_process_rss_bytes() -> Option<usize> {
     unsafe {
         let mut info: MachTaskBasicInfo = std::mem::zeroed();
         let mut count = MACH_TASK_BASIC_INFO_COUNT;
-        let result = task_info(mach_task_self(), MACH_TASK_BASIC_INFO, &mut info, &mut count);
+        let result = task_info(
+            mach_task_self(),
+            MACH_TASK_BASIC_INFO,
+            &mut info,
+            &mut count,
+        );
         if result == 0 {
             Some(info.resident_size as usize)
         } else {
@@ -77,29 +82,121 @@ fn get_process_rss_bytes() -> Option<usize> {
     None
 }
 
+/// Build the object-backed `SyncStore` shared by the two object-store openers.
+///
+/// `bucket` is the atom `memory` for an in-process bucket (tests, and the
+/// disk-less differential tests), or an S3 bucket name. In the S3 case the
+/// builder reads credentials, region and any endpoint override from the
+/// environment, so no secret ever passes through a Prolog term.
+///
+/// Conditional PUT is set to ETag matching because the label store implements
+/// its compare-and-swap with it; without that, concurrent head updates would
+/// silently clobber one another.
+fn open_object_store_impl<C: QueryableContextType>(
+    context: &Context<C>,
+    bucket_term: &Term,
+    prefix_term: &Term,
+    cache_size_term: &Term,
+) -> PrologResult<SyncStore> {
+    use terminus_store::object_store::{
+        aws::{AmazonS3Builder, S3ConditionalPut},
+        memory::InMemory,
+        ObjectStore,
+    };
+
+    let prefix: PrologText = prefix_term.get_ex()?;
+    let cache_size: usize = cache_size_term.get_ex::<u64>()? as usize;
+
+    let bucket: std::sync::Arc<dyn ObjectStore> = if attempt(bucket_term.unify(atom!("memory")))? {
+        std::sync::Arc::new(InMemory::new())
+    } else {
+        let bucket_name: PrologText = bucket_term.get_ex()?;
+        let s3 = context.try_or_die_generic(
+            AmazonS3Builder::from_env()
+                .with_bucket_name(&*bucket_name)
+                .with_conditional_put(S3ConditionalPut::ETagMatch)
+                .build(),
+        )?;
+        std::sync::Arc::new(s3)
+    };
+
+    Ok(SyncStore::wrap(terminus_store::open_object_store(
+        bucket, &*prefix, cache_size,
+    )))
+}
+
 predicates! {
     pub semidet fn open_memory_store(_context, term) {
         let store = open_sync_memory_store();
-        term.unify(&WrappedStore(store))
+        term.unify(&WrappedStore(ReadStore::materialized(store)))
     }
 
     pub semidet fn open_directory_store(_context, dir_term, out_term) {
         let dir: PrologText = dir_term.get_ex()?;
         let store = open_sync_directory_store(&*dir);
-        out_term.unify(&WrappedStore(store))
+        out_term.unify(&WrappedStore(ReadStore::materialized(store)))
     }
 
     pub semidet fn open_raw_archive_store(_context, dir_term, out_term) {
         let dir: PrologText = dir_term.get_ex()?;
         let store = open_sync_raw_archive_store(&*dir);
-        out_term.unify(&WrappedStore(store))
+        out_term.unify(&WrappedStore(ReadStore::materialized(store)))
     }
 
     pub semidet fn open_archive_store(_context, dir_term, cache_size_term, out_term) {
         let dir: PrologText = dir_term.get_ex()?;
         let cache_size: usize = cache_size_term.get_ex::<u64>()? as usize;
         let store = open_sync_archive_store(&*dir, cache_size);
-        out_term.unify(&WrappedStore(store))
+        out_term.unify(&WrappedStore(ReadStore::materialized(store)))
+    }
+
+    /// open_object_store(+Bucket, +Prefix, +CacheSize, -Store)
+    ///
+    /// Layers are materialized as usual; only the backing storage differs.
+    /// `Bucket` is the atom `memory` (an in-process bucket, for tests) or an S3
+    /// bucket name, in which case credentials and region come from the standard
+    /// AWS environment variables -- they are never passed through Prolog.
+    pub semidet fn open_object_store(context, bucket_term, prefix_term, cache_size_term, out_term) {
+        let store = open_object_store_impl(context, bucket_term, prefix_term, cache_size_term)?;
+        out_term.unify(&WrappedStore(ReadStore::materialized(store)))
+    }
+
+    /// open_diskless_object_store(+Bucket, +Prefix, +CacheSize, -Store)
+    ///
+    /// As `open_object_store/4`, but layers read from this store are *disk-less*:
+    /// queries fetch only the blocks they touch via ranged GETs, and no whole
+    /// layer is ever materialized.
+    ///
+    /// Reads are covered; writes are not. A builder opened on a disk-less layer
+    /// raises an error rather than silently taking a slower path, so a write
+    /// workload should open the same bucket with `open_object_store/4`.
+    pub semidet fn open_diskless_object_store(context, bucket_term, prefix_term, cache_size_term, out_term) {
+        let store = open_object_store_impl(context, bucket_term, prefix_term, cache_size_term)?;
+        out_term.unify(&WrappedStore(ReadStore::diskless(store)))
+    }
+
+    /// store_diskless(+Store, -DisklessStore)
+    ///
+    /// A disk-less *view* of an already-open store: same bucket, same labels,
+    /// same layers, but layers reached through it are read block-lazily instead
+    /// of being materialized.
+    ///
+    /// This is the useful shape in practice. A process typically wants both --
+    /// writes and history maintenance on the materialized handle, queries on the
+    /// disk-less one -- and opening the bucket twice would give two independent
+    /// caches (and, for an in-process bucket, two unrelated stores entirely).
+    pub semidet fn store_diskless(_context, store_term, out_term) {
+        let store: WrappedStore = store_term.get_ex()?;
+        out_term.unify(&WrappedStore(ReadStore::diskless((**store).clone())))
+    }
+
+    /// store_materialized(+Store, -MaterializedStore)
+    ///
+    /// The inverse of `store_diskless/2`: a view of the same store whose layers
+    /// are materialized. Lets a writer be derived from a disk-less reader.
+    pub semidet fn store_materialized(_context, store_term, out_term) {
+        let store: WrappedStore = store_term.get_ex()?;
+        out_term.unify(&WrappedStore(ReadStore::materialized((**store).clone())))
     }
 
     pub semidet fn open_grpc_store(context, dir_term, address_term, initial_pool_term, cache_size_term, out_term) {
@@ -119,7 +216,7 @@ predicates! {
             .with_lru_used_bytes(move || lru_ref.used_bytes())
             .with_lru_evict(move |fraction| lru_evict_ref.evict_to_target(fraction)));
 
-        out_term.unify(&WrappedStore(store))
+        out_term.unify(&WrappedStore(ReadStore::materialized(store)))
     }
 
     pub semidet fn open_write(context, store_or_graph_or_layer_term, builder_term) {
@@ -287,4 +384,40 @@ predicates! {
     }
 }
 
-wrapped_clone_blob!("store", pub WrappedStore, SyncStore, defaults);
+/// A store plus how its layers should be read.
+///
+/// `Deref`s to the underlying `SyncStore`, so every existing call site keeps
+/// working; only `store_id_layer` consults the flag, to decide whether to hand
+/// out a materialized or a disk-less layer handle.
+#[derive(Clone)]
+pub struct ReadStore {
+    inner: SyncStore,
+    /// Read layers disk-lessly (block-granular ranged GETs) instead of
+    /// materializing them. Opt-in, and only meaningful on an object backend.
+    pub diskless: bool,
+}
+
+impl ReadStore {
+    pub fn materialized(inner: SyncStore) -> Self {
+        Self {
+            inner,
+            diskless: false,
+        }
+    }
+
+    pub fn diskless(inner: SyncStore) -> Self {
+        Self {
+            inner,
+            diskless: true,
+        }
+    }
+}
+
+impl std::ops::Deref for ReadStore {
+    type Target = SyncStore;
+    fn deref(&self) -> &SyncStore {
+        &self.inner
+    }
+}
+
+wrapped_clone_blob!("store", pub WrappedStore, ReadStore, defaults);
